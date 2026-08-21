@@ -231,7 +231,7 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_attachSurfac
                 return Ok(JNI_FALSE);
             };
             let window = unsafe {
-                ndk_sys::ANativeWindow_fromSurface(env.as_raw() as *mut _, surface.as_raw() as _)
+                ndk_sys::ANativeWindow_fromSurface(env.get_raw() as *mut _, surface.as_raw() as _)
             };
             if window.is_null() {
                 return Ok(JNI_FALSE);

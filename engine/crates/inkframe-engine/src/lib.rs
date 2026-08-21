@@ -42,10 +42,16 @@ pub trait RendererBackend: Send + 'static {
 pub struct NullRenderer;
 
 impl RendererBackend for NullRenderer {
-    fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> { Ok(()) }
+    fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> {
+        Ok(())
+    }
     fn detach_surface(&mut self) {}
-    fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> { Ok(()) }
-    fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> { Ok(()) }
+    fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +194,11 @@ mod tests {
     fn rejects_zero_sized_surfaces() {
         let engine = EngineHost::spawn(NullRenderer);
         assert_eq!(
-            engine.attach_surface(NativeSurface { handle: 1, width: 0, height: 10 }),
+            engine.attach_surface(NativeSurface {
+                handle: 1,
+                width: 0,
+                height: 10,
+            }),
             Err(SubmitError::InvalidSurfaceSize)
         );
     }

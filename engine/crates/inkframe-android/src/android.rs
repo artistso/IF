@@ -1,9 +1,9 @@
-use ash::{khr, vk, Entry, Instance};
+use ash::{Entry, Instance, khr, vk};
 use inkframe_core::decode_stroke_samples;
 use inkframe_engine::{EngineHost, NativeSurface, RendererBackend};
-use jni::objects::{JByteBuffer, JClass, JObject};
-use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::EnvUnowned;
+use jni::objects::{JByteBuffer, JClass, JObject};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -34,7 +34,8 @@ struct AndroidRenderer {
 
 impl AndroidRenderer {
     fn new() -> Result<Self, String> {
-        let entry = unsafe { Entry::load() }.map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
+        let entry =
+            unsafe { Entry::load() }.map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
         let app_name = c"InkFrame";
         let engine_name = c"InkFrame Rust Engine";
         let app_info = vk::ApplicationInfo::default()
@@ -43,7 +44,10 @@ impl AndroidRenderer {
             .engine_name(engine_name)
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_1);
-        let extensions = [khr::surface::NAME.as_ptr(), khr::android_surface::NAME.as_ptr()];
+        let extensions = [
+            khr::surface::NAME.as_ptr(),
+            khr::android_surface::NAME.as_ptr(),
+        ];
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&extensions);
@@ -83,18 +87,27 @@ impl AndroidRenderer {
         self.height = 0;
     }
 
-    fn find_presentation_queue(&self, surface: vk::SurfaceKHR) -> Result<(vk::PhysicalDevice, u32), String> {
+    fn find_presentation_queue(
+        &self,
+        surface: vk::SurfaceKHR,
+    ) -> Result<(vk::PhysicalDevice, u32), String> {
         let devices = unsafe { self.instance.enumerate_physical_devices() }
             .map_err(|e| format!("enumerate_physical_devices failed: {e:?}"))?;
         for device in devices {
-            let families = unsafe { self.instance.get_physical_device_queue_family_properties(device) };
+            let families = unsafe {
+                self.instance
+                    .get_physical_device_queue_family_properties(device)
+            };
             for (index, family) in families.iter().enumerate() {
                 if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
                     continue;
                 }
                 let present = unsafe {
-                    self.surface_loader
-                        .get_physical_device_surface_support(device, index as u32, surface)
+                    self.surface_loader.get_physical_device_surface_support(
+                        device,
+                        index as u32,
+                        surface,
+                    )
                 }
                 .map_err(|e| format!("surface support query failed: {e:?}"))?;
                 if present {
@@ -217,12 +230,11 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_attachSurfac
             if width <= 0 || height <= 0 {
                 return Ok(JNI_FALSE);
             }
-            let Some(host) = engine(id) else { return Ok(JNI_FALSE) };
+            let Some(host) = engine(id) else {
+                return Ok(JNI_FALSE);
+            };
             let window = unsafe {
-                ndk_sys::ANativeWindow_fromSurface(
-                    env.as_raw() as *mut _,
-                    surface.as_raw() as _,
-                )
+                ndk_sys::ANativeWindow_fromSurface(env.as_raw() as *mut _, surface.as_raw() as _)
             };
             if window.is_null() {
                 return Ok(JNI_FALSE);
@@ -251,11 +263,13 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_detachSurfac
 ) -> jboolean {
     unowned_env
         .with_env(|_env| -> Result<jboolean, jni::errors::Error> {
-            Ok(if engine(id).is_some_and(|host| host.detach_surface().is_ok()) {
-                JNI_TRUE
-            } else {
-                JNI_FALSE
-            })
+            Ok(
+                if engine(id).is_some_and(|host| host.detach_surface().is_ok()) {
+                    JNI_TRUE
+                } else {
+                    JNI_FALSE
+                },
+            )
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
@@ -273,11 +287,13 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_resizeSurfac
             if width <= 0 || height <= 0 {
                 return Ok(JNI_FALSE);
             }
-            Ok(if engine(id).is_some_and(|host| host.resize(width as u32, height as u32).is_ok()) {
-                JNI_TRUE
-            } else {
-                JNI_FALSE
-            })
+            Ok(
+                if engine(id).is_some_and(|host| host.resize(width as u32, height as u32).is_ok()) {
+                    JNI_TRUE
+                } else {
+                    JNI_FALSE
+                },
+            )
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
@@ -295,7 +311,9 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_pushInput<'c
             if sample_count < 0 {
                 return Ok(JNI_FALSE);
             }
-            let Some(host) = engine(id) else { return Ok(JNI_FALSE) };
+            let Some(host) = engine(id) else {
+                return Ok(JNI_FALSE);
+            };
             let capacity = env.get_direct_buffer_capacity(&buffer)?;
             let address = env.get_direct_buffer_address(&buffer)?;
             let bytes = unsafe { std::slice::from_raw_parts(address.cast_const(), capacity) };
@@ -303,7 +321,11 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_pushInput<'c
                 Ok(samples) => samples,
                 Err(_) => return Ok(JNI_FALSE),
             };
-            Ok(if host.submit_input(samples).is_ok() { JNI_TRUE } else { JNI_FALSE })
+            Ok(if host.submit_input(samples).is_ok() {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            })
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }

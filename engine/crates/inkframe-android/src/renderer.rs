@@ -100,8 +100,8 @@ pub(crate) struct AndroidRenderer {
 
 impl AndroidRenderer {
     pub(crate) fn new() -> Result<Self, String> {
-        let entry = unsafe { Entry::load() }
-            .map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
+        let entry =
+            unsafe { Entry::load() }.map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
         let app_name = c"InkFrame";
         let engine_name = c"InkFrame Rust Engine";
         let app_info = vk::ApplicationInfo::default()

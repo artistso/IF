@@ -400,7 +400,7 @@ impl AndroidRenderer {
         let persistent_copy_supported = capabilities
             .supported_usage_flags
             .contains(vk::ImageUsageFlags::TRANSFER_DST)
-            && ViewportCache::pixel_order_for_format(surface_format.format).is_some();
+            && ViewportCache::pixel_encoding_for_format(surface_format.format).is_some();
         let mut image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
         if persistent_copy_supported {
             image_usage |= vk::ImageUsageFlags::TRANSFER_DST;

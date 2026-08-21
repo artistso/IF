@@ -466,10 +466,7 @@ mod tests {
     fn build_up_mode_intentionally_accumulates_overlaps() {
         let dab = RasterDab::new(32.5, 32.5, 8.0);
         let mut raster = SparseRaster::new();
-        raster.apply_stroke(
-            [dab, dab],
-            StrokeStyle::ink(WHITE_HALF).with_build_up(true),
-        );
+        raster.apply_stroke([dab, dab], StrokeStyle::ink(WHITE_HALF).with_build_up(true));
         assert!(raster.pixel_rgba(32, 32)[3] > 128);
     }
 

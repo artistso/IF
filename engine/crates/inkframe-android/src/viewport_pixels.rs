@@ -110,30 +110,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negative_tile_is_clipped_into_viewport() {
-        let region = clip_tile_region(
-            TileCoord { x: -1, y: 0 },
-            full_tile_rect(),
-            100,
-            100,
+    fn negative_tiles_are_offscreen_without_overflow() {
+        assert!(
+            clip_tile_region(
+                TileCoord { x: -1, y: 0 },
+                full_tile_rect(),
+                100,
+                100,
+            )
+            .is_none()
         );
-        assert!(region.is_none());
-
-        let partial = clip_tile_region(
-            TileCoord { x: -1, y: 0 },
-            DirtyRect {
-                min_x: 250,
-                min_y: 5,
-                max_x: 256,
-                max_y: 20,
-            },
-            100,
-            100,
-        )
-        .unwrap();
-        assert_eq!(partial.local_x, 250);
-        assert_eq!(partial.image_x, 0);
-        assert_eq!(partial.width, 0_u16.saturating_add(0));
+        assert!(
+            clip_tile_region(
+                TileCoord {
+                    x: i32::MIN,
+                    y: i32::MIN,
+                },
+                full_tile_rect(),
+                100,
+                100,
+            )
+            .is_none()
+        );
     }
 
     #[test]

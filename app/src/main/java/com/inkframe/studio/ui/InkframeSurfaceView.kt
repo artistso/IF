@@ -32,8 +32,16 @@ class InkframeSurfaceView(
 
         if (!surfaceAttached) {
             surfaceAttached = engine.attachSurface(holder.surface, width, height)
-        } else {
-            engine.resizeSurface(width, height)
+            return
+        }
+
+        if (!engine.resizeSurface(width, height)) {
+            // A concurrent rotation/surface transition can invalidate the swapchain even
+            // after the native retry. Reset ownership and reacquire a fresh ANativeWindow
+            // rather than leaving surfaceAttached=true with no presentable swapchain.
+            engine.detachSurface()
+            surfaceAttached = false
+            surfaceAttached = engine.attachSurface(holder.surface, width, height)
         }
     }
 

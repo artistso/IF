@@ -99,12 +99,7 @@ fn encode_linear_channel(value: f32, transfer: TransferEncoding) -> u8 {
     (encoded * 255.0).round() as u8
 }
 
-fn encode_pixel(
-    src: &[u8],
-    encoding: PixelEncoding,
-    background: [f32; 3],
-    output: &mut Vec<u8>,
-) {
+fn encode_pixel(src: &[u8], encoding: PixelEncoding, background: [f32; 3], output: &mut Vec<u8>) {
     let alpha = src[3] as f32 / 255.0;
     let inverse_alpha = 1.0 - alpha;
     // Source RGB is already premultiplied in linear space.

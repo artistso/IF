@@ -114,24 +114,21 @@ impl RendererBackend for AndroidRenderer {
         }
         let window_ptr = target.handle as *mut _;
         let create_info = vk::AndroidSurfaceCreateInfoKHR::default().window(window_ptr);
-        let surface = match unsafe {
+        let surface = unsafe {
             self.android_surface_loader
                 .create_android_surface(&create_info, None)
-        } {
-            Ok(surface) => surface,
-            Err(error) => {
-                Self::release_window(target.handle);
-                return Err(format!("vkCreateAndroidSurfaceKHR failed: {error:?}"));
-            }
-        };
+        }
+        .map_err(|error| format!("vkCreateAndroidSurfaceKHR failed: {error:?}"))?;
         let queue = match self.find_presentation_queue(surface) {
             Ok(queue) => queue,
             Err(error) => {
                 unsafe { self.surface_loader.destroy_surface(surface, None) };
-                Self::release_window(target.handle);
                 return Err(error);
             }
         };
+        // Ownership of the ANativeWindow transfers to the renderer only after the
+        // complete attach succeeds. If this method returns Err, JNI remains the owner
+        // and releases its ANativeWindow reference exactly once.
         self.window = Some(target.handle);
         self.surface = Some(surface);
         self.presentation_queue = Some(queue);

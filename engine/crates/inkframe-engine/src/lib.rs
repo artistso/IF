@@ -306,4 +306,3 @@ mod tests {
         assert!(engine.submit_input(vec![sample]).is_ok());
     }
 }
-

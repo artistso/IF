@@ -1,13 +1,14 @@
 use inkframe_core::{Brush, StrokeSample, sample_flags};
+use inkframe_raster::{RasterDab, SparseRaster, StrokeScratch, StrokeStyle};
 
 const MAX_DABS_PER_SEGMENT: usize = 4096;
 const MIN_SPACING_PX: f32 = 0.75;
 const MAX_SPACING_PX: f32 = 4.0;
-/// Temporary safety bound for the first-present brush proof. Until completed
-/// strokes are flattened into sparse raster tiles, the oldest bootstrap dabs
-/// roll off instead of allowing frame-recording cost and memory to grow forever.
+/// Temporary safety bound for the first-present brush proof. Persistent raster
+/// state is no longer bounded by this value; only the legacy Vulkan replay is.
 pub(crate) const MAX_BOOTSTRAP_DABS: usize = 4096;
 const MAX_PREDICTED_DABS: usize = 512;
+const BOOTSTRAP_INK_RGBA: [u8; 4] = [240, 240, 250, 255];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StrokeDab {
@@ -18,12 +19,26 @@ pub(crate) struct StrokeDab {
 }
 
 #[derive(Debug)]
+enum ActiveRasterStroke {
+    Normal {
+        scratch: StrokeScratch,
+        style: StrokeStyle,
+    },
+    BuildUp {
+        dabs: Vec<RasterDab>,
+        style: StrokeStyle,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct StrokePreview {
     brush: Brush,
     committed: Vec<StrokeDab>,
     predicted: Vec<StrokeDab>,
     last_actual: Option<StrokeSample>,
     active_stroke_start: Option<usize>,
+    raster: SparseRaster,
+    active_raster_stroke: Option<ActiveRasterStroke>,
 }
 
 impl Default for StrokePreview {
@@ -41,6 +56,8 @@ impl StrokePreview {
             predicted: Vec::new(),
             last_actual: None,
             active_stroke_start: None,
+            raster: SparseRaster::new(),
+            active_raster_stroke: None,
         }
     }
 
@@ -50,6 +67,13 @@ impl StrokePreview {
 
     pub(crate) fn predicted(&self) -> &[StrokeDab] {
         &self.predicted
+    }
+
+    /// Authoritative persistent pixels accumulated from completed actual strokes.
+    /// The Vulkan bootstrap renderer does not consume these tiles yet; that is the
+    /// next integration layer after lifecycle semantics are proven independently.
+    pub(crate) fn raster(&self) -> &SparseRaster {
+        &self.raster
     }
 
     pub(crate) fn ingest(&mut self, samples: &[StrokeSample]) {
@@ -79,24 +103,100 @@ impl StrokePreview {
             }
 
             if sample.flags & sample_flags::DOWN != 0 {
+                // A second DOWN without UP/CANCEL means Android/lifecycle delivery
+                // skipped a terminal event. Discard the stale unsealed stroke.
+                if self.active_stroke_start.is_some() {
+                    self.cancel_active_stroke();
+                }
                 self.active_stroke_start = Some(self.committed.len());
                 self.last_actual = None;
+                self.begin_raster_stroke(sample);
             } else if self.active_stroke_start.is_none() {
                 // Be defensive if Android delivers a MOVE after a lifecycle transition
                 // where the original DOWN was not observed by this engine instance.
                 self.active_stroke_start = Some(self.committed.len());
+                self.begin_raster_stroke(sample);
             }
 
             let previous = self.last_actual;
-            Self::append_segment(&self.brush, &mut self.committed, previous, sample);
+            let mut generated = Vec::new();
+            Self::append_segment(&self.brush, &mut generated, previous, sample);
+            self.accumulate_actual_raster(&generated);
+            self.committed.extend_from_slice(&generated);
             self.enforce_committed_limit();
             self.last_actual = Some(sample);
             predicted_anchor = self.last_actual;
 
             if sample.flags & sample_flags::UP != 0 {
+                self.commit_active_raster_stroke();
                 self.last_actual = None;
                 self.active_stroke_start = None;
                 predicted_anchor = None;
+            }
+        }
+    }
+
+    fn begin_raster_stroke(&mut self, sample: StrokeSample) {
+        let eraser = sample.flags & sample_flags::ERASER != 0;
+        let alpha = (self.brush.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let style = if eraser {
+            StrokeStyle::erase()
+        } else {
+            StrokeStyle::ink([
+                BOOTSTRAP_INK_RGBA[0],
+                BOOTSTRAP_INK_RGBA[1],
+                BOOTSTRAP_INK_RGBA[2],
+                alpha,
+            ])
+        }
+        .with_build_up(self.brush.build_up);
+
+        self.active_raster_stroke = Some(if style.build_up {
+            ActiveRasterStroke::BuildUp {
+                dabs: Vec::new(),
+                style,
+            }
+        } else {
+            ActiveRasterStroke::Normal {
+                scratch: StrokeScratch::new(),
+                style,
+            }
+        });
+    }
+
+    fn accumulate_actual_raster(&mut self, dabs: &[StrokeDab]) {
+        let Some(active) = &mut self.active_raster_stroke else {
+            return;
+        };
+        match active {
+            ActiveRasterStroke::Normal { scratch, .. } => {
+                scratch.add_dabs(
+                    dabs.iter()
+                        .map(|dab| RasterDab::new(dab.x, dab.y, dab.diameter)),
+                );
+            }
+            ActiveRasterStroke::BuildUp {
+                dabs: build_up_dabs,
+                ..
+            } => {
+                build_up_dabs.extend(
+                    dabs.iter()
+                        .map(|dab| RasterDab::new(dab.x, dab.y, dab.diameter)),
+                );
+            }
+        }
+    }
+
+    fn commit_active_raster_stroke(&mut self) {
+        let Some(active) = self.active_raster_stroke.take() else {
+            return;
+        };
+        match active {
+            ActiveRasterStroke::Normal { scratch, style } => {
+                self.raster.commit_normal_stroke(scratch, style);
+            }
+            ActiveRasterStroke::BuildUp { dabs, style } => {
+                self.raster.apply_stroke(dabs, style);
             }
         }
     }
@@ -105,6 +205,9 @@ impl StrokePreview {
         if let Some(start) = self.active_stroke_start.take() {
             self.committed.truncate(start);
         }
+        // Persistent tiles were never touched by a normal active stroke, so
+        // cancellation is an O(1) discard of its scratch coverage.
+        self.active_raster_stroke = None;
         self.last_actual = None;
         self.predicted.clear();
     }
@@ -242,6 +345,67 @@ mod tests {
     }
 
     #[test]
+    fn actual_pixels_remain_scratch_only_until_up() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[
+            sample(0.0, 0.5, sample_flags::DOWN, 1),
+            sample(8.0, 0.5, sample_flags::MOVE, 2),
+        ]);
+
+        assert_eq!(preview.raster().tile_count(), 0);
+        assert_eq!(preview.raster().pixel_rgba(4, 10), [0; 4]);
+
+        preview.ingest(&[sample(8.0, 0.5, sample_flags::UP, 3)]);
+        assert!(preview.raster().tile_count() > 0);
+        assert!(preview.raster().pixel_rgba(4, 10)[3] > 0);
+    }
+
+    #[test]
+    fn cancel_discards_sparse_scratch_without_touching_document() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[
+            sample(40.0, 0.5, sample_flags::DOWN, 1),
+            sample(48.0, 0.5, sample_flags::MOVE, 2),
+        ]);
+        assert_eq!(preview.raster().tile_count(), 0);
+
+        preview.ingest(&[sample(48.0, 0.5, sample_flags::CANCEL, 3)]);
+        assert_eq!(preview.raster().tile_count(), 0);
+        assert_eq!(preview.raster().pixel_rgba(44, 10), [0; 4]);
+    }
+
+    #[test]
+    fn predicted_tail_never_enters_persistent_raster() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[sample(0.0, 0.5, sample_flags::DOWN, 1)]);
+        preview.ingest(&[sample(
+            80.0,
+            0.5,
+            sample_flags::MOVE | sample_flags::PREDICTED,
+            2,
+        )]);
+        assert_eq!(preview.raster().pixel_rgba(80, 10), [0; 4]);
+
+        preview.ingest(&[sample(0.0, 0.5, sample_flags::UP, 3)]);
+        assert!(preview.raster().pixel_rgba(0, 10)[3] > 0);
+        assert_eq!(preview.raster().pixel_rgba(80, 10), [0; 4]);
+    }
+
+    #[test]
+    fn second_down_discards_stale_unsealed_stroke() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[
+            sample(10.0, 0.5, sample_flags::DOWN, 1),
+            sample(20.0, 0.5, sample_flags::MOVE, 2),
+            sample(100.0, 0.5, sample_flags::DOWN, 3),
+            sample(104.0, 0.5, sample_flags::UP, 4),
+        ]);
+
+        assert_eq!(preview.raster().pixel_rgba(15, 10), [0; 4]);
+        assert!(preview.raster().pixel_rgba(102, 10)[3] > 0);
+    }
+
+    #[test]
     fn separate_strokes_do_not_interpolate_across_the_gap() {
         let mut preview = StrokePreview::default();
         preview.ingest(&[
@@ -259,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_bootstrap_replay_is_hard_bounded() {
+    fn committed_bootstrap_replay_is_hard_bounded_but_raster_is_not_dab_bounded() {
         let mut preview = StrokePreview::default();
         preview.ingest(&[
             sample(0.0, 0.5, sample_flags::DOWN, 1),
@@ -267,5 +431,9 @@ mod tests {
         ]);
 
         assert_eq!(preview.committed().len(), MAX_BOOTSTRAP_DABS);
+        assert_eq!(preview.raster().tile_count(), 0);
+
+        preview.ingest(&[sample(50_000.0, 0.5, sample_flags::UP, 3)]);
+        assert!(preview.raster().tile_count() > 1);
     }
 }

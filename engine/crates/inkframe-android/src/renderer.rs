@@ -1,9 +1,12 @@
 use crate::stroke::{MAX_BOOTSTRAP_DABS, StrokeDab, StrokePreview};
+use crate::viewport::{ViewportCache, transition_swapchain_for_legacy_render};
+use crate::viewport_pixels::full_tile_rect;
 use ash::{Device, Entry, Instance, khr, vk};
 use inkframe_core::StrokeSample;
 use inkframe_engine::{NativeSurface, RendererBackend};
 
 const BACKGROUND_COLOR: [f32; 4] = [0.055, 0.055, 0.065, 1.0];
+const BACKGROUND_RGB8: [u8; 3] = [14, 14, 17];
 const INK_COLOR: [f32; 4] = [0.94, 0.94, 0.98, 1.0];
 const PREDICTED_COLOR: [f32; 4] = [0.55, 0.65, 0.90, 1.0];
 const PREDICTED_ERASER_COLOR: [f32; 4] = [0.18, 0.20, 0.26, 1.0];
@@ -12,6 +15,8 @@ struct SwapchainState {
     loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     extent: vk::Extent2D,
+    format: vk::Format,
+    images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
     framebuffers: Vec<vk::Framebuffer>,
@@ -20,6 +25,7 @@ struct SwapchainState {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
+    persistent_copy_supported: bool,
 }
 
 impl SwapchainState {
@@ -27,11 +33,15 @@ impl SwapchainState {
         loader: khr::swapchain::Device,
         swapchain: vk::SwapchainKHR,
         extent: vk::Extent2D,
+        format: vk::Format,
+        persistent_copy_supported: bool,
     ) -> Self {
         Self {
             loader,
             swapchain,
             extent,
+            format,
+            images: Vec::new(),
             image_views: Vec::new(),
             render_pass: vk::RenderPass::null(),
             framebuffers: Vec::new(),
@@ -40,6 +50,7 @@ impl SwapchainState {
             image_available: vk::Semaphore::null(),
             render_finished: vk::Semaphore::null(),
             in_flight: vk::Fence::null(),
+            persistent_copy_supported,
         }
     }
 
@@ -70,6 +81,7 @@ impl SwapchainState {
                 self.loader.destroy_swapchain(self.swapchain, None);
             }
         }
+        self.images.clear();
         self.command_buffers.clear();
         self.in_flight = vk::Fence::null();
         self.render_finished = vk::Semaphore::null();
@@ -92,6 +104,7 @@ pub(crate) struct AndroidRenderer {
     device: Option<Device>,
     graphics_queue: Option<vk::Queue>,
     swapchain: Option<SwapchainState>,
+    viewport_cache: Option<ViewportCache>,
     width: u32,
     height: u32,
     last_input_time_ns: i64,
@@ -134,6 +147,7 @@ impl AndroidRenderer {
             device: None,
             graphics_queue: None,
             swapchain: None,
+            viewport_cache: None,
             width: 0,
             height: 0,
             last_input_time_ns: 0,
@@ -153,7 +167,17 @@ impl AndroidRenderer {
         }
     }
 
+    fn destroy_viewport_cache(&mut self) {
+        let Some(cache) = self.viewport_cache.take() else {
+            return;
+        };
+        if let Some(device) = &self.device {
+            cache.destroy(device);
+        }
+    }
+
     fn destroy_swapchain(&mut self) {
+        self.destroy_viewport_cache();
         let Some(mut state) = self.swapchain.take() else {
             return;
         };
@@ -373,6 +397,15 @@ impl AndroidRenderer {
         }
         let image_count = Self::choose_image_count(capabilities);
         let composite_alpha = Self::choose_composite_alpha(capabilities.supported_composite_alpha)?;
+        let persistent_copy_supported = capabilities
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_DST)
+            && ViewportCache::pixel_encoding_for_format(surface_format.format).is_some();
+        let mut image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if persistent_copy_supported {
+            image_usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
+
         let swapchain_loader = khr::swapchain::Device::new(&self.instance, device);
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
@@ -381,7 +414,7 @@ impl AndroidRenderer {
             .image_color_space(surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(image_usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
@@ -390,11 +423,17 @@ impl AndroidRenderer {
         let swapchain = unsafe { swapchain_loader.create_swapchain(&create_info, None) }
             .map_err(|e| format!("vkCreateSwapchainKHR failed: {e:?}"))?;
 
-        let mut state = SwapchainState::new(swapchain_loader, swapchain, extent);
+        let mut state = SwapchainState::new(
+            swapchain_loader,
+            swapchain,
+            extent,
+            surface_format.format,
+            persistent_copy_supported,
+        );
         let build_result = (|| -> Result<(), String> {
-            let images = unsafe { state.loader.get_swapchain_images(state.swapchain) }
+            state.images = unsafe { state.loader.get_swapchain_images(state.swapchain) }
                 .map_err(|e| format!("vkGetSwapchainImagesKHR failed: {e:?}"))?;
-            if images.is_empty() {
+            if state.images.is_empty() {
                 return Err("Vulkan swapchain contains no images".into());
             }
 
@@ -404,7 +443,7 @@ impl AndroidRenderer {
                 .level_count(1)
                 .base_array_layer(0)
                 .layer_count(1);
-            for image in images {
+            for &image in &state.images {
                 let view_info = vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
@@ -415,14 +454,18 @@ impl AndroidRenderer {
                 state.image_views.push(view);
             }
 
+            // The swapchain image is explicitly initialized before the render
+            // pass: either copied from the persistent viewport or cleared by the
+            // legacy fallback. LOAD preserves that base while active/predicted
+            // dabs are overlaid.
             let color_attachment = vk::AttachmentDescription::default()
                 .format(surface_format.format)
                 .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .load_op(vk::AttachmentLoadOp::LOAD)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
             let color_reference = vk::AttachmentReference::default()
                 .attachment(0)
@@ -488,6 +531,123 @@ impl AndroidRenderer {
             return Err(error);
         }
         self.swapchain = Some(state);
+
+        if persistent_copy_supported {
+            if let Err(error) = self.rebuild_viewport_cache() {
+                self.wait_device_idle();
+                self.destroy_swapchain();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_viewport_cache(&mut self) -> Result<(), String> {
+        self.destroy_viewport_cache();
+        let (extent, format, command_pool, supported) = {
+            let state = self
+                .swapchain
+                .as_ref()
+                .ok_or_else(|| "cannot create viewport cache without a swapchain".to_string())?;
+            (
+                state.extent,
+                state.format,
+                state.command_pool,
+                state.persistent_copy_supported,
+            )
+        };
+        if !supported {
+            return Ok(());
+        }
+        let physical_device = self
+            .physical_device
+            .ok_or_else(|| "viewport cache has no physical device".to_string())?;
+        let queue = self
+            .graphics_queue
+            .ok_or_else(|| "viewport cache has no graphics queue".to_string())?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| "viewport cache has no logical device".to_string())?;
+
+        let cache = ViewportCache::new(
+            &self.instance,
+            device,
+            physical_device,
+            queue,
+            command_pool,
+            extent,
+            format,
+            BACKGROUND_COLOR,
+        )?;
+
+        let upload_result = {
+            let raster = self.stroke.raster();
+            let coords: Vec<_> = self.stroke.raster_tile_coords().collect();
+            let tiles: Vec<_> = coords
+                .into_iter()
+                .filter_map(|coord| {
+                    raster
+                        .tile(coord)
+                        .map(|tile| (coord, full_tile_rect(), tile.pixels()))
+                })
+                .collect();
+            cache.upload_tiles(
+                &self.instance,
+                device,
+                physical_device,
+                queue,
+                command_pool,
+                BACKGROUND_RGB8,
+                tiles,
+            )
+        };
+        if let Err(error) = upload_result {
+            cache.destroy(device);
+            return Err(error);
+        }
+
+        self.viewport_cache = Some(cache);
+        self.stroke.raster_mut().clear_dirty();
+        Ok(())
+    }
+
+    fn sync_dirty_raster_to_viewport(&mut self) -> Result<(), String> {
+        if self.viewport_cache.is_none() {
+            return Ok(());
+        }
+        let (command_pool, physical_device, queue) = {
+            let state = self
+                .swapchain
+                .as_ref()
+                .ok_or_else(|| "viewport cache exists without a swapchain".to_string())?;
+            (
+                state.command_pool,
+                self.physical_device
+                    .ok_or_else(|| "viewport cache has no physical device".to_string())?,
+                self.graphics_queue
+                    .ok_or_else(|| "viewport cache has no graphics queue".to_string())?,
+            )
+        };
+
+        {
+            let cache = self.viewport_cache.as_ref().unwrap();
+            let device = self
+                .device
+                .as_ref()
+                .ok_or_else(|| "viewport cache has no logical device".to_string())?;
+            let tiles: Vec<_> = self.stroke.raster().dirty_tiles().collect();
+            cache.upload_tiles(
+                &self.instance,
+                device,
+                physical_device,
+                queue,
+                command_pool,
+                BACKGROUND_RGB8,
+                tiles,
+            )?;
+        }
+        self.stroke.raster_mut().clear_dirty();
         Ok(())
     }
 
@@ -513,6 +673,28 @@ impl AndroidRenderer {
             base_array_layer: 0,
             layer_count: 1,
         })
+    }
+
+    fn clear_background(device: &Device, command_buffer: vk::CommandBuffer, extent: vk::Extent2D) {
+        let attachment = vk::ClearAttachment::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .color_attachment(0)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: BACKGROUND_COLOR,
+                },
+            });
+        let rect = vk::ClearRect {
+            rect: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            },
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        unsafe {
+            device.cmd_clear_attachments(command_buffer, &[attachment], &[rect]);
+        }
     }
 
     fn emit_dab(
@@ -564,6 +746,10 @@ impl AndroidRenderer {
             .framebuffers
             .get(image_index as usize)
             .ok_or_else(|| "swapchain framebuffer index is invalid".to_string())?;
+        let swapchain_image = *state
+            .images
+            .get(image_index as usize)
+            .ok_or_else(|| "swapchain image index is invalid".to_string())?;
 
         unsafe {
             device
@@ -573,13 +759,14 @@ impl AndroidRenderer {
             device
                 .begin_command_buffer(command_buffer, &begin_info)
                 .map_err(|e| format!("vkBeginCommandBuffer failed: {e:?}"))?;
+
+            if let Some(cache) = &self.viewport_cache {
+                cache.record_copy_to_swapchain(device, command_buffer, swapchain_image);
+            } else {
+                transition_swapchain_for_legacy_render(device, command_buffer, swapchain_image);
+            }
         }
 
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: BACKGROUND_COLOR,
-            },
-        }];
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: state.extent,
@@ -587,8 +774,7 @@ impl AndroidRenderer {
         let render_pass_begin = vk::RenderPassBeginInfo::default()
             .render_pass(state.render_pass)
             .framebuffer(framebuffer)
-            .render_area(render_area)
-            .clear_values(&clear_values);
+            .render_area(render_area);
         unsafe {
             device.cmd_begin_render_pass(
                 command_buffer,
@@ -596,15 +782,25 @@ impl AndroidRenderer {
                 vk::SubpassContents::INLINE,
             );
         }
-        // The state layer already hard-caps committed dabs, and the renderer
-        // repeats the bound defensively so command recording can never grow
-        // with the entire document history during this bootstrap milestone.
-        for &dab in self.stroke.committed().iter().take(MAX_BOOTSTRAP_DABS) {
-            Self::emit_dab(device, command_buffer, state.extent, dab, false);
+
+        if self.viewport_cache.is_some() {
+            // Completed strokes already live in the persistent viewport cache.
+            // Only the still-cancellable actual stroke is drawn as an overlay.
+            for &dab in self.stroke.active() {
+                Self::emit_dab(device, command_buffer, state.extent, dab, false);
+            }
+        } else {
+            // Compatibility fallback for surfaces without TRANSFER_DST or a
+            // supported 32-bit RGBA/BGRA format.
+            Self::clear_background(device, command_buffer, state.extent);
+            for &dab in self.stroke.committed().iter().take(MAX_BOOTSTRAP_DABS) {
+                Self::emit_dab(device, command_buffer, state.extent, dab, false);
+            }
         }
         for &dab in self.stroke.predicted() {
             Self::emit_dab(device, command_buffer, state.extent, dab, true);
         }
+
         unsafe {
             device.cmd_end_render_pass(command_buffer);
             device
@@ -652,7 +848,10 @@ impl AndroidRenderer {
                 .map_err(|e| format!("vkResetFences failed: {e:?}"))?;
         }
         let wait_semaphores = [state.image_available];
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        // Persistent frames touch the acquired image in TRANSFER before the
+        // overlay render pass, so acquisition must be visible to both stages.
+        let wait_stages =
+            [vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let command_buffers = [command_buffer];
         let signal_semaphores = [state.render_finished];
         let submit_info = vk::SubmitInfo::default()
@@ -788,6 +987,11 @@ impl RendererBackend for AndroidRenderer {
         if self.swapchain.is_none() {
             return self.recreate_and_present(surface, self.width, self.height);
         }
+
+        // UP may have just sealed persistent raster pixels. Upload only those
+        // dirty tile regions before the next base-frame copy. MOVE/prediction
+        // packets normally produce no persistent dirt and return immediately.
+        self.sync_dirty_raster_to_viewport()?;
 
         match self.present_frame() {
             Ok(()) => Ok(()),

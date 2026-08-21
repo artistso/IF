@@ -3,6 +3,7 @@ use std::collections::HashMap;
 pub const TILE_SIZE: u32 = 256;
 pub const BYTES_PER_PIXEL: usize = 4;
 pub const TILE_BYTES: usize = TILE_SIZE as usize * TILE_SIZE as usize * BYTES_PER_PIXEL;
+const TILE_PIXELS: usize = TILE_SIZE as usize * TILE_SIZE as usize;
 const MIN_DAB_DIAMETER_PX: f32 = 0.5;
 const MAX_DAB_DIAMETER_PX: f32 = 4096.0;
 
@@ -61,35 +62,49 @@ pub enum PaintMode {
     Erase,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrokeStyle {
+    /// Straight-alpha source color. Tiles are stored as premultiplied RGBA8.
+    pub rgba: [u8; 4],
+    pub mode: PaintMode,
+    /// Build-up deliberately composites overlapping dabs repeatedly. Normal
+    /// strokes accumulate coverage into scratch storage and composite once.
+    pub build_up: bool,
+}
+
+impl StrokeStyle {
+    pub const fn ink(rgba: [u8; 4]) -> Self {
+        Self {
+            rgba,
+            mode: PaintMode::Paint,
+            build_up: false,
+        }
+    }
+
+    pub const fn erase() -> Self {
+        Self {
+            rgba: [0, 0, 0, 0],
+            mode: PaintMode::Erase,
+            build_up: false,
+        }
+    }
+
+    pub const fn with_build_up(mut self, build_up: bool) -> Self {
+        self.build_up = build_up;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RasterDab {
     pub x: f32,
     pub y: f32,
     pub diameter: f32,
-    /// Straight-alpha input color. The tile store converts it to premultiplied RGBA8.
-    pub rgba: [u8; 4],
-    pub mode: PaintMode,
 }
 
 impl RasterDab {
-    pub fn ink(x: f32, y: f32, diameter: f32, rgba: [u8; 4]) -> Self {
-        Self {
-            x,
-            y,
-            diameter,
-            rgba,
-            mode: PaintMode::Paint,
-        }
-    }
-
-    pub fn erase(x: f32, y: f32, diameter: f32) -> Self {
-        Self {
-            x,
-            y,
-            diameter,
-            rgba: [0, 0, 0, 0],
-            mode: PaintMode::Erase,
-        }
+    pub const fn new(x: f32, y: f32, diameter: f32) -> Self {
+        Self { x, y, diameter }
     }
 }
 
@@ -130,6 +145,47 @@ impl RasterTile {
 
     fn clear_dirty(&mut self) {
         self.dirty = None;
+    }
+}
+
+#[derive(Debug)]
+struct ScratchCoverage {
+    values: Vec<u8>,
+    dirty: Option<DirtyRect>,
+}
+
+impl Default for ScratchCoverage {
+    fn default() -> Self {
+        Self {
+            values: vec![0; TILE_PIXELS],
+            dirty: None,
+        }
+    }
+}
+
+impl ScratchCoverage {
+    fn pixel_index(local_x: u16, local_y: u16) -> usize {
+        local_y as usize * TILE_SIZE as usize + local_x as usize
+    }
+
+    fn accumulate_max(&mut self, local_x: u16, local_y: u16, coverage: f32) {
+        let value = byte(coverage);
+        if value == 0 {
+            return;
+        }
+        let index = Self::pixel_index(local_x, local_y);
+        if value <= self.values[index] {
+            return;
+        }
+        self.values[index] = value;
+        match &mut self.dirty {
+            Some(rect) => rect.include(local_x, local_y),
+            None => self.dirty = Some(DirtyRect::from_pixel(local_x, local_y)),
+        }
+    }
+
+    fn coverage(&self, local_x: u16, local_y: u16) -> f32 {
+        self.values[Self::pixel_index(local_x, local_y)] as f32 / 255.0
     }
 }
 
@@ -183,24 +239,77 @@ impl SparseRaster {
         self.tiles.clear();
     }
 
-    pub fn apply_dabs<I>(&mut self, dabs: I)
+    pub fn apply_dab(&mut self, dab: RasterDab, style: StrokeStyle) {
+        self.apply_stroke([dab], style);
+    }
+
+    /// Applies one logical stroke. Normal strokes first accumulate maximum
+    /// geometric coverage in scratch tiles, then composite once so overlapping
+    /// resampling dabs cannot darken the stroke. Build-up strokes intentionally
+    /// composite each dab in order.
+    pub fn apply_stroke<I>(&mut self, dabs: I, style: StrokeStyle)
     where
         I: IntoIterator<Item = RasterDab>,
     {
+        if style.build_up {
+            for dab in dabs {
+                self.visit_dab_pixels(dab, |raster, x, y, coverage| {
+                    raster.apply_pixel(x, y, style, coverage);
+                });
+            }
+            return;
+        }
+
+        let mut scratch: HashMap<TileCoord, ScratchCoverage> = HashMap::new();
         for dab in dabs {
-            self.apply_dab(dab);
+            Self::visit_dab_pixels_static(dab, |x, y, coverage| {
+                let coord = TileCoord::from_pixel(x, y);
+                let local_x = x.rem_euclid(TILE_SIZE as i32) as u16;
+                let local_y = y.rem_euclid(TILE_SIZE as i32) as u16;
+                scratch
+                    .entry(coord)
+                    .or_default()
+                    .accumulate_max(local_x, local_y, coverage);
+            });
+        }
+
+        for (coord, coverage_tile) in scratch {
+            let Some(dirty) = coverage_tile.dirty else {
+                continue;
+            };
+            for local_y in dirty.min_y..dirty.max_y {
+                for local_x in dirty.min_x..dirty.max_x {
+                    let coverage = coverage_tile.coverage(local_x, local_y);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let x = coord.x * TILE_SIZE as i32 + local_x as i32;
+                    let y = coord.y * TILE_SIZE as i32 + local_y as i32;
+                    self.apply_pixel(x, y, style, coverage);
+                }
+            }
         }
     }
 
-    pub fn apply_dab(&mut self, dab: RasterDab) {
+    fn visit_dab_pixels<F>(&mut self, dab: RasterDab, mut visitor: F)
+    where
+        F: FnMut(&mut Self, i32, i32, f32),
+    {
+        Self::visit_dab_pixels_static(dab, |x, y, coverage| {
+            visitor(self, x, y, coverage);
+        });
+    }
+
+    fn visit_dab_pixels_static<F>(dab: RasterDab, mut visitor: F)
+    where
+        F: FnMut(i32, i32, f32),
+    {
         if !dab.x.is_finite() || !dab.y.is_finite() || !dab.diameter.is_finite() {
             return;
         }
 
         let diameter = dab.diameter.clamp(MIN_DAB_DIAMETER_PX, MAX_DAB_DIAMETER_PX);
         let radius = diameter * 0.5;
-        // One pixel of analytical feathering keeps the CPU persistence layer from
-        // producing visibly jagged tile-edge circles before the final GPU brush path.
         let outer_radius = radius + 0.5;
         let min_x = (dab.x - outer_radius).floor() as i32;
         let min_y = (dab.y - outer_radius).floor() as i32;
@@ -213,33 +322,34 @@ impl SparseRaster {
                 let center_x = pixel_x as f32 + 0.5;
                 let distance = (center_x - dab.x).hypot(center_y - dab.y);
                 let coverage = (outer_radius - distance).clamp(0.0, 1.0);
-                if coverage <= 0.0 {
-                    continue;
+                if coverage > 0.0 {
+                    visitor(pixel_x, pixel_y, coverage);
                 }
-                self.apply_pixel(pixel_x, pixel_y, dab, coverage);
             }
         }
     }
 
-    fn apply_pixel(&mut self, x: i32, y: i32, dab: RasterDab, coverage: f32) {
+    fn apply_pixel(&mut self, x: i32, y: i32, style: StrokeStyle, coverage: f32) {
         let coord = TileCoord::from_pixel(x, y);
-        if matches!(dab.mode, PaintMode::Erase) && !self.tiles.contains_key(&coord) {
-            // Erasing untouched space must remain free: no sparse tile allocation.
-            return;
-        }
-
         let local_x = x.rem_euclid(TILE_SIZE as i32) as u16;
         let local_y = y.rem_euclid(TILE_SIZE as i32) as u16;
-        let tile = self.tiles.entry(coord).or_default();
         let index = RasterTile::pixel_index(local_x, local_y);
-        let before: [u8; 4] = tile.pixels[index..index + 4].try_into().unwrap();
-        let after = match dab.mode {
-            PaintMode::Paint => blend_premultiplied(before, dab.rgba, coverage),
+        let before = self
+            .tiles
+            .get(&coord)
+            .map(|tile| tile.pixels[index..index + 4].try_into().unwrap())
+            .unwrap_or([0; 4]);
+        let after = match style.mode {
+            PaintMode::Paint => blend_premultiplied(before, style.rgba, coverage),
             PaintMode::Erase => erase_premultiplied(before, coverage),
         };
         if before == after {
             return;
         }
+
+        // Do not allocate a persistent 256 KiB tile until the operation has
+        // proven that at least one RGBA8 pixel actually changes.
+        let tile = self.tiles.entry(coord).or_default();
         tile.pixels[index..index + 4].copy_from_slice(&after);
         tile.mark_dirty(local_x, local_y);
     }
@@ -286,6 +396,7 @@ mod tests {
     use super::*;
 
     const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const WHITE_HALF: [u8; 4] = [255, 255, 255, 128];
 
     #[test]
     fn untouched_raster_allocates_nothing() {
@@ -297,7 +408,7 @@ mod tests {
     #[test]
     fn dab_allocates_only_the_touched_tile() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::ink(128.0, 128.0, 6.0, WHITE));
+        raster.apply_dab(RasterDab::new(128.0, 128.0, 6.0), StrokeStyle::ink(WHITE));
 
         assert_eq!(raster.tile_count(), 1);
         assert_eq!(raster.memory_bytes(), TILE_BYTES);
@@ -307,7 +418,7 @@ mod tests {
     #[test]
     fn dab_crossing_a_tile_corner_allocates_four_tiles() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::ink(256.0, 256.0, 8.0, WHITE));
+        raster.apply_dab(RasterDab::new(256.0, 256.0, 8.0), StrokeStyle::ink(WHITE));
 
         assert_eq!(raster.tile_count(), 4);
         for coord in [
@@ -323,24 +434,60 @@ mod tests {
     #[test]
     fn erasing_untouched_space_does_not_allocate_tiles() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::erase(1000.0, 1000.0, 32.0));
+        raster.apply_dab(RasterDab::new(1000.0, 1000.0, 32.0), StrokeStyle::erase());
         assert_eq!(raster.tile_count(), 0);
+    }
+
+    #[test]
+    fn transparent_paint_does_not_allocate_empty_tiles() {
+        let mut raster = SparseRaster::new();
+        raster.apply_dab(
+            RasterDab::new(256.0, 256.0, 512.0),
+            StrokeStyle::ink([255, 255, 255, 0]),
+        );
+        assert_eq!(raster.tile_count(), 0);
+        assert_eq!(raster.dirty_tiles().count(), 0);
+    }
+
+    #[test]
+    fn normal_stroke_overlap_does_not_darken_with_dab_density() {
+        let dab = RasterDab::new(32.5, 32.5, 8.0);
+        let mut single = SparseRaster::new();
+        single.apply_stroke([dab], StrokeStyle::ink(WHITE_HALF));
+        let single_pixel = single.pixel_rgba(32, 32);
+
+        let mut doubled = SparseRaster::new();
+        doubled.apply_stroke([dab, dab], StrokeStyle::ink(WHITE_HALF));
+        assert_eq!(doubled.pixel_rgba(32, 32), single_pixel);
+        assert_eq!(single_pixel[3], 128);
+    }
+
+    #[test]
+    fn build_up_mode_intentionally_accumulates_overlaps() {
+        let dab = RasterDab::new(32.5, 32.5, 8.0);
+        let mut raster = SparseRaster::new();
+        raster.apply_stroke(
+            [dab, dab],
+            StrokeStyle::ink(WHITE_HALF).with_build_up(true),
+        );
+        assert!(raster.pixel_rgba(32, 32)[3] > 128);
     }
 
     #[test]
     fn eraser_removes_premultiplied_color_and_alpha() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::ink(32.5, 32.5, 8.0, WHITE));
+        let dab = RasterDab::new(32.5, 32.5, 8.0);
+        raster.apply_dab(dab, StrokeStyle::ink(WHITE));
         assert_eq!(raster.pixel_rgba(32, 32), WHITE);
 
-        raster.apply_dab(RasterDab::erase(32.5, 32.5, 8.0));
+        raster.apply_dab(dab, StrokeStyle::erase());
         assert_eq!(raster.pixel_rgba(32, 32), [0; 4]);
     }
 
     #[test]
     fn negative_document_coordinates_use_euclidean_tile_addressing() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::ink(-0.5, -0.5, 1.0, WHITE));
+        raster.apply_dab(RasterDab::new(-0.5, -0.5, 1.0), StrokeStyle::ink(WHITE));
 
         assert!(raster.tile(TileCoord { x: -1, y: -1 }).is_some());
         assert!(raster.pixel_rgba(-1, -1)[3] > 0);
@@ -349,7 +496,7 @@ mod tests {
     #[test]
     fn dirty_tiles_can_be_acknowledged_without_dropping_pixels() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::ink(12.5, 20.5, 2.0, WHITE));
+        raster.apply_dab(RasterDab::new(12.5, 20.5, 2.0), StrokeStyle::ink(WHITE));
 
         let dirty: Vec<_> = raster.dirty_tiles().collect();
         assert_eq!(dirty.len(), 1);
@@ -364,8 +511,9 @@ mod tests {
     #[test]
     fn distant_marks_remain_sparse_instead_of_allocating_a_monolithic_canvas() {
         let mut raster = SparseRaster::new();
-        raster.apply_dab(RasterDab::ink(10.0, 10.0, 4.0, WHITE));
-        raster.apply_dab(RasterDab::ink(20_000.0, 20_000.0, 4.0, WHITE));
+        let style = StrokeStyle::ink(WHITE);
+        raster.apply_dab(RasterDab::new(10.0, 10.0, 4.0), style);
+        raster.apply_dab(RasterDab::new(20_000.0, 20_000.0, 4.0), style);
 
         assert_eq!(raster.tile_count(), 2);
         assert_eq!(raster.memory_bytes(), TILE_BYTES * 2);

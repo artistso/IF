@@ -189,6 +189,60 @@ impl ScratchCoverage {
     }
 }
 
+/// Temporary, cancellable coverage for one normal (non-build-up) stroke.
+///
+/// Coverage is accumulated by tile across as many input packets as Android
+/// delivers. Dropping or clearing this value cancels the stroke without ever
+/// mutating the persistent raster. Sealing consumes it exactly once through
+/// [`SparseRaster::commit_normal_stroke`].
+#[derive(Debug, Default)]
+pub struct StrokeScratch {
+    tiles: HashMap<TileCoord, ScratchCoverage>,
+}
+
+impl StrokeScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+
+    pub fn coverage_bytes(&self) -> usize {
+        self.tiles.len() * TILE_PIXELS
+    }
+
+    pub fn clear(&mut self) {
+        self.tiles.clear();
+    }
+
+    pub fn add_dab(&mut self, dab: RasterDab) {
+        SparseRaster::visit_dab_pixels_static(dab, |x, y, coverage| {
+            let coord = TileCoord::from_pixel(x, y);
+            let local_x = x.rem_euclid(TILE_SIZE as i32) as u16;
+            let local_y = y.rem_euclid(TILE_SIZE as i32) as u16;
+            self.tiles
+                .entry(coord)
+                .or_default()
+                .accumulate_max(local_x, local_y, coverage);
+        });
+    }
+
+    pub fn add_dabs<I>(&mut self, dabs: I)
+    where
+        I: IntoIterator<Item = RasterDab>,
+    {
+        for dab in dabs {
+            self.add_dab(dab);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SparseRaster {
     tiles: HashMap<TileCoord, RasterTile>,
@@ -243,10 +297,10 @@ impl SparseRaster {
         self.apply_stroke([dab], style);
     }
 
-    /// Applies one logical stroke. Normal strokes first accumulate maximum
-    /// geometric coverage in scratch tiles, then composite once so overlapping
-    /// resampling dabs cannot darken the stroke. Build-up strokes intentionally
-    /// composite each dab in order.
+    /// Applies one complete logical stroke in a single call.
+    ///
+    /// Normal strokes use the same scratch path as incremental live input.
+    /// Build-up strokes intentionally composite each dab in order.
     pub fn apply_stroke<I>(&mut self, dabs: I, style: StrokeStyle)
     where
         I: IntoIterator<Item = RasterDab>,
@@ -260,20 +314,19 @@ impl SparseRaster {
             return;
         }
 
-        let mut scratch: HashMap<TileCoord, ScratchCoverage> = HashMap::new();
-        for dab in dabs {
-            Self::visit_dab_pixels_static(dab, |x, y, coverage| {
-                let coord = TileCoord::from_pixel(x, y);
-                let local_x = x.rem_euclid(TILE_SIZE as i32) as u16;
-                let local_y = y.rem_euclid(TILE_SIZE as i32) as u16;
-                scratch
-                    .entry(coord)
-                    .or_default()
-                    .accumulate_max(local_x, local_y, coverage);
-            });
-        }
+        let mut scratch = StrokeScratch::new();
+        scratch.add_dabs(dabs);
+        self.commit_normal_stroke(scratch, style);
+    }
 
-        for (coord, coverage_tile) in scratch {
+    /// Seals a cancellable normal-stroke scratch target into persistent tiles.
+    ///
+    /// `StrokeScratch` represents non-build-up semantics by construction, so
+    /// this method deliberately clears the style's build-up bit before the one
+    /// persistent composite.
+    pub fn commit_normal_stroke(&mut self, scratch: StrokeScratch, mut style: StrokeStyle) {
+        style.build_up = false;
+        for (coord, coverage_tile) in scratch.tiles {
             let Some(dirty) = coverage_tile.dirty else {
                 continue;
             };
@@ -347,8 +400,6 @@ impl SparseRaster {
             return;
         }
 
-        // Do not allocate a persistent 256 KiB tile until the operation has
-        // proven that at least one RGBA8 pixel actually changes.
         let tile = self.tiles.entry(coord).or_default();
         tile.pixels[index..index + 4].copy_from_slice(&after);
         tile.mark_dirty(local_x, local_y);
@@ -460,6 +511,41 @@ mod tests {
         doubled.apply_stroke([dab, dab], StrokeStyle::ink(WHITE_HALF));
         assert_eq!(doubled.pixel_rgba(32, 32), single_pixel);
         assert_eq!(single_pixel[3], 128);
+    }
+
+    #[test]
+    fn incremental_scratch_matches_one_shot_normal_stroke() {
+        let first = RasterDab::new(30.5, 32.5, 8.0);
+        let second = RasterDab::new(34.5, 32.5, 8.0);
+        let style = StrokeStyle::ink(WHITE_HALF);
+
+        let mut one_shot = SparseRaster::new();
+        one_shot.apply_stroke([first, second], style);
+
+        let mut scratch = StrokeScratch::new();
+        scratch.add_dab(first);
+        scratch.add_dab(second);
+        let mut incremental = SparseRaster::new();
+        incremental.commit_normal_stroke(scratch, style);
+
+        for x in 26..40 {
+            assert_eq!(incremental.pixel_rgba(x, 32), one_shot.pixel_rgba(x, 32));
+        }
+    }
+
+    #[test]
+    fn uncommitted_scratch_never_mutates_persistent_tiles() {
+        let mut raster = SparseRaster::new();
+        let mut scratch = StrokeScratch::new();
+        scratch.add_dab(RasterDab::new(32.5, 32.5, 8.0));
+        assert!(!scratch.is_empty());
+        assert_eq!(scratch.tile_count(), 1);
+        assert_eq!(scratch.coverage_bytes(), TILE_PIXELS);
+
+        scratch.clear();
+        assert!(scratch.is_empty());
+        assert_eq!(raster.tile_count(), 0);
+        assert_eq!(raster.pixel_rgba(32, 32), [0; 4]);
     }
 
     #[test]

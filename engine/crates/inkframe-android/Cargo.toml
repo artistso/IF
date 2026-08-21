@@ -15,4 +15,7 @@ inkframe-engine.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 ash = "0.38.0"
 jni = "0.22.4"
-ndk-sys = { version = "0.6.0", features = ["nativewindow"] }
+# ANativeWindow_fromSurface/ANativeWindow_release are provided by libandroid.
+# Enabling ndk-sys's `nativewindow` feature adds -lnativewindow, which is only
+# needed for newer Native Window APIs and breaks our baseline Android link.
+ndk-sys = "0.6.0"

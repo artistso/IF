@@ -10,8 +10,9 @@ type LifecycleReply = SyncSender<Result<(), String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSurface {
-    /// Platform handle encoded as an integer. Once an attach command reaches the
-    /// renderer, the renderer owns the referenced platform object and must release it.
+    /// Platform handle encoded as an integer. Ownership remains with the caller while
+    /// attach is being attempted and transfers to the renderer only after attach succeeds.
+    /// On a failed attach, the caller remains responsible for releasing the platform object.
     pub handle: usize,
     pub width: u32,
     pub height: u32,

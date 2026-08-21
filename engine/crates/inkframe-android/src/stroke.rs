@@ -118,8 +118,8 @@ impl StrokePreview {
         let distance = dx.hypot(dy);
         let start_diameter = brush.diameter_for_pressure(previous.pressure);
         let end_diameter = brush.diameter_for_pressure(sample.pressure);
-        let spacing = (start_diameter.min(end_diameter) * 0.35)
-            .clamp(MIN_SPACING_PX, MAX_SPACING_PX);
+        let spacing =
+            (start_diameter.min(end_diameter) * 0.35).clamp(MIN_SPACING_PX, MAX_SPACING_PX);
         let steps = ((distance / spacing).ceil() as usize)
             .max(1)
             .min(MAX_DABS_PER_SEGMENT);
@@ -225,9 +225,11 @@ mod tests {
             sample(100.0, 0.5, sample_flags::DOWN, 3),
         ]);
 
-        assert!(preview
-            .committed()
-            .iter()
-            .all(|dab| dab.x <= 1.0 || dab.x >= 99.0));
+        assert!(
+            preview
+                .committed()
+                .iter()
+                .all(|dab| dab.x <= 1.0 || dab.x >= 99.0)
+        );
     }
 }

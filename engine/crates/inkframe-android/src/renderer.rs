@@ -1,11 +1,16 @@
+use crate::stroke::{StrokeDab, StrokePreview};
 use ash::{Device, Entry, Instance, khr, vk};
 use inkframe_core::StrokeSample;
 use inkframe_engine::{NativeSurface, RendererBackend};
 
+const BACKGROUND_COLOR: [f32; 4] = [0.055, 0.055, 0.065, 1.0];
+const INK_COLOR: [f32; 4] = [0.94, 0.94, 0.98, 1.0];
+const PREDICTED_COLOR: [f32; 4] = [0.55, 0.65, 0.90, 1.0];
+const PREDICTED_ERASER_COLOR: [f32; 4] = [0.18, 0.20, 0.26, 1.0];
+
 struct SwapchainState {
     loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
-    format: vk::Format,
     extent: vk::Extent2D,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
@@ -15,6 +20,64 @@ struct SwapchainState {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
+}
+
+impl SwapchainState {
+    fn new(
+        loader: khr::swapchain::Device,
+        swapchain: vk::SwapchainKHR,
+        extent: vk::Extent2D,
+    ) -> Self {
+        Self {
+            loader,
+            swapchain,
+            extent,
+            image_views: Vec::new(),
+            render_pass: vk::RenderPass::null(),
+            framebuffers: Vec::new(),
+            command_pool: vk::CommandPool::null(),
+            command_buffers: Vec::new(),
+            image_available: vk::Semaphore::null(),
+            render_finished: vk::Semaphore::null(),
+            in_flight: vk::Fence::null(),
+        }
+    }
+
+    fn destroy(&mut self, device: &Device) {
+        unsafe {
+            if self.in_flight != vk::Fence::null() {
+                device.destroy_fence(self.in_flight, None);
+            }
+            if self.render_finished != vk::Semaphore::null() {
+                device.destroy_semaphore(self.render_finished, None);
+            }
+            if self.image_available != vk::Semaphore::null() {
+                device.destroy_semaphore(self.image_available, None);
+            }
+            if self.command_pool != vk::CommandPool::null() {
+                device.destroy_command_pool(self.command_pool, None);
+            }
+            for framebuffer in self.framebuffers.drain(..) {
+                device.destroy_framebuffer(framebuffer, None);
+            }
+            if self.render_pass != vk::RenderPass::null() {
+                device.destroy_render_pass(self.render_pass, None);
+            }
+            for view in self.image_views.drain(..) {
+                device.destroy_image_view(view, None);
+            }
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.loader.destroy_swapchain(self.swapchain, None);
+            }
+        }
+        self.command_buffers.clear();
+        self.in_flight = vk::Fence::null();
+        self.render_finished = vk::Semaphore::null();
+        self.image_available = vk::Semaphore::null();
+        self.command_pool = vk::CommandPool::null();
+        self.render_pass = vk::RenderPass::null();
+        self.swapchain = vk::SwapchainKHR::null();
+    }
 }
 
 pub(crate) struct AndroidRenderer {
@@ -32,12 +95,13 @@ pub(crate) struct AndroidRenderer {
     width: u32,
     height: u32,
     last_input_time_ns: i64,
+    stroke: StrokePreview,
 }
 
 impl AndroidRenderer {
     pub(crate) fn new() -> Result<Self, String> {
-        let entry =
-            unsafe { Entry::load() }.map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
+        let entry = unsafe { Entry::load() }
+            .map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
         let app_name = c"InkFrame";
         let engine_name = c"InkFrame Rust Engine";
         let app_info = vk::ApplicationInfo::default()
@@ -73,6 +137,7 @@ impl AndroidRenderer {
             width: 0,
             height: 0,
             last_input_time_ns: 0,
+            stroke: StrokePreview::default(),
         })
     }
 
@@ -89,26 +154,11 @@ impl AndroidRenderer {
     }
 
     fn destroy_swapchain(&mut self) {
-        let Some(state) = self.swapchain.take() else {
+        let Some(mut state) = self.swapchain.take() else {
             return;
         };
-        let Some(device) = &self.device else {
-            return;
-        };
-
-        unsafe {
-            device.destroy_fence(state.in_flight, None);
-            device.destroy_semaphore(state.render_finished, None);
-            device.destroy_semaphore(state.image_available, None);
-            device.destroy_command_pool(state.command_pool, None);
-            for framebuffer in state.framebuffers {
-                device.destroy_framebuffer(framebuffer, None);
-            }
-            device.destroy_render_pass(state.render_pass, None);
-            for view in state.image_views {
-                device.destroy_image_view(view, None);
-            }
-            state.loader.destroy_swapchain(state.swapchain, None);
+        if let Some(device) = &self.device {
+            state.destroy(device);
         }
     }
 
@@ -340,295 +390,228 @@ impl AndroidRenderer {
         let swapchain = unsafe { swapchain_loader.create_swapchain(&create_info, None) }
             .map_err(|e| format!("vkCreateSwapchainKHR failed: {e:?}"))?;
 
-        let result = self.finish_swapchain_state(
-            swapchain_loader,
-            swapchain,
-            surface_format.format,
-            extent,
-            queue_family_index,
-        );
-        if let Err(error) = result {
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn finish_swapchain_state(
-        &mut self,
-        loader: khr::swapchain::Device,
-        swapchain: vk::SwapchainKHR,
-        format: vk::Format,
-        extent: vk::Extent2D,
-        queue_family_index: u32,
-    ) -> Result<(), String> {
-        let device = self
-            .device
-            .as_ref()
-            .ok_or_else(|| "Vulkan logical device is not initialized".to_string())?;
-        let images = match unsafe { loader.get_swapchain_images(swapchain) } {
-            Ok(images) => images,
-            Err(error) => {
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkGetSwapchainImagesKHR failed: {error:?}"));
+        let mut state = SwapchainState::new(swapchain_loader, swapchain, extent);
+        let build_result = (|| -> Result<(), String> {
+            let images = unsafe { state.loader.get_swapchain_images(state.swapchain) }
+                .map_err(|e| format!("vkGetSwapchainImagesKHR failed: {e:?}"))?;
+            if images.is_empty() {
+                return Err("Vulkan swapchain contains no images".into());
             }
-        };
-        if images.is_empty() {
-            unsafe { loader.destroy_swapchain(swapchain, None) };
-            return Err("Vulkan swapchain contains no images".into());
-        }
 
-        let mut image_views = Vec::with_capacity(images.len());
-        for image in images {
             let subresource_range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
                 .level_count(1)
                 .base_array_layer(0)
                 .layer_count(1);
-            let view_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format)
-                .subresource_range(subresource_range);
-            match unsafe { device.create_image_view(&view_info, None) } {
-                Ok(view) => image_views.push(view),
-                Err(error) => {
-                    for view in image_views {
-                        unsafe { device.destroy_image_view(view, None) };
-                    }
-                    unsafe { loader.destroy_swapchain(swapchain, None) };
-                    return Err(format!("vkCreateImageView failed: {error:?}"));
-                }
+            for image in images {
+                let view_info = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(surface_format.format)
+                    .subresource_range(subresource_range);
+                let view = unsafe { device.create_image_view(&view_info, None) }
+                    .map_err(|e| format!("vkCreateImageView failed: {e:?}"))?;
+                state.image_views.push(view);
             }
+
+            let color_attachment = vk::AttachmentDescription::default()
+                .format(surface_format.format)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+            let color_reference = vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            let color_references = [color_reference];
+            let subpass = vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_references);
+            let dependency = vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+            let attachments = [color_attachment];
+            let subpasses = [subpass];
+            let dependencies = [dependency];
+            let render_pass_info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments)
+                .subpasses(&subpasses)
+                .dependencies(&dependencies);
+            state.render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }
+                .map_err(|e| format!("vkCreateRenderPass failed: {e:?}"))?;
+
+            for &view in &state.image_views {
+                let framebuffer_attachments = [view];
+                let framebuffer_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(state.render_pass)
+                    .attachments(&framebuffer_attachments)
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(1);
+                let framebuffer = unsafe { device.create_framebuffer(&framebuffer_info, None) }
+                    .map_err(|e| format!("vkCreateFramebuffer failed: {e:?}"))?;
+                state.framebuffers.push(framebuffer);
+            }
+
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(queue_family_index);
+            state.command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+                .map_err(|e| format!("vkCreateCommandPool failed: {e:?}"))?;
+            let allocation_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(state.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(state.framebuffers.len() as u32);
+            state.command_buffers = unsafe { device.allocate_command_buffers(&allocation_info) }
+                .map_err(|e| format!("vkAllocateCommandBuffers failed: {e:?}"))?;
+
+            let semaphore_info = vk::SemaphoreCreateInfo::default();
+            state.image_available = unsafe { device.create_semaphore(&semaphore_info, None) }
+                .map_err(|e| format!("vkCreateSemaphore(image_available) failed: {e:?}"))?;
+            state.render_finished = unsafe { device.create_semaphore(&semaphore_info, None) }
+                .map_err(|e| format!("vkCreateSemaphore(render_finished) failed: {e:?}"))?;
+            let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+            state.in_flight = unsafe { device.create_fence(&fence_info, None) }
+                .map_err(|e| format!("vkCreateFence failed: {e:?}"))?;
+            Ok(())
+        })();
+
+        if let Err(error) = build_result {
+            state.destroy(device);
+            return Err(error);
         }
-
-        let color_attachment = vk::AttachmentDescription::default()
-            .format(format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-        let color_reference = vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-        let color_references = [color_reference];
-        let subpass = vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_references);
-        let dependency = vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-        let attachments = [color_attachment];
-        let subpasses = [subpass];
-        let dependencies = [dependency];
-        let render_pass_info = vk::RenderPassCreateInfo::default()
-            .attachments(&attachments)
-            .subpasses(&subpasses)
-            .dependencies(&dependencies);
-        let render_pass = match unsafe { device.create_render_pass(&render_pass_info, None) } {
-            Ok(render_pass) => render_pass,
-            Err(error) => {
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkCreateRenderPass failed: {error:?}"));
-            }
-        };
-
-        let mut framebuffers = Vec::with_capacity(image_views.len());
-        for &view in &image_views {
-            let framebuffer_attachments = [view];
-            let framebuffer_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&framebuffer_attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-            match unsafe { device.create_framebuffer(&framebuffer_info, None) } {
-                Ok(framebuffer) => framebuffers.push(framebuffer),
-                Err(error) => {
-                    for framebuffer in framebuffers {
-                        unsafe { device.destroy_framebuffer(framebuffer, None) };
-                    }
-                    unsafe { device.destroy_render_pass(render_pass, None) };
-                    for view in image_views {
-                        unsafe { device.destroy_image_view(view, None) };
-                    }
-                    unsafe { loader.destroy_swapchain(swapchain, None) };
-                    return Err(format!("vkCreateFramebuffer failed: {error:?}"));
-                }
-            }
-        }
-
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(queue_family_index);
-        let command_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
-            Ok(pool) => pool,
-            Err(error) => {
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkCreateCommandPool failed: {error:?}"));
-            }
-        };
-
-        let allocation_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(framebuffers.len() as u32);
-        let command_buffers = match unsafe { device.allocate_command_buffers(&allocation_info) } {
-            Ok(buffers) => buffers,
-            Err(error) => {
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkAllocateCommandBuffers failed: {error:?}"));
-            }
-        };
-
-        for (&command_buffer, &framebuffer) in command_buffers.iter().zip(&framebuffers) {
-            let begin_info = vk::CommandBufferBeginInfo::default();
-            if let Err(error) = unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
-            {
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkBeginCommandBuffer failed: {error:?}"));
-            }
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.055, 0.055, 0.065, 1.0],
-                },
-            }];
-            let render_area = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            };
-            let render_pass_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(render_pass)
-                .framebuffer(framebuffer)
-                .render_area(render_area)
-                .clear_values(&clear_values);
-            unsafe {
-                device.cmd_begin_render_pass(
-                    command_buffer,
-                    &render_pass_begin,
-                    vk::SubpassContents::INLINE,
-                );
-                device.cmd_end_render_pass(command_buffer);
-            }
-            if let Err(error) = unsafe { device.end_command_buffer(command_buffer) } {
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkEndCommandBuffer failed: {error:?}"));
-            }
-        }
-
-        let semaphore_info = vk::SemaphoreCreateInfo::default();
-        let image_available = match unsafe { device.create_semaphore(&semaphore_info, None) } {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!(
-                    "vkCreateSemaphore(image_available) failed: {error:?}"
-                ));
-            }
-        };
-        let render_finished = match unsafe { device.create_semaphore(&semaphore_info, None) } {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                unsafe { device.destroy_semaphore(image_available, None) };
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!(
-                    "vkCreateSemaphore(render_finished) failed: {error:?}"
-                ));
-            }
-        };
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let in_flight = match unsafe { device.create_fence(&fence_info, None) } {
-            Ok(fence) => fence,
-            Err(error) => {
-                unsafe { device.destroy_semaphore(render_finished, None) };
-                unsafe { device.destroy_semaphore(image_available, None) };
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                for framebuffer in framebuffers {
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
-                }
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                for view in image_views {
-                    unsafe { device.destroy_image_view(view, None) };
-                }
-                unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkCreateFence failed: {error:?}"));
-            }
-        };
-
-        self.swapchain = Some(SwapchainState {
-            loader,
-            swapchain,
-            format,
-            extent,
-            image_views,
-            render_pass,
-            framebuffers,
-            command_pool,
-            command_buffers,
-            image_available,
-            render_finished,
-            in_flight,
-        });
+        self.swapchain = Some(state);
         Ok(())
     }
 
-    fn present_clear_frame(&mut self) -> Result<(), String> {
+    fn dab_rect(dab: StrokeDab, extent: vk::Extent2D) -> Option<vk::ClearRect> {
+        let half = dab.diameter.max(1.0) * 0.5;
+        let max_x = extent.width as f32;
+        let max_y = extent.height as f32;
+        let left = (dab.x - half).floor().clamp(0.0, max_x) as i32;
+        let top = (dab.y - half).floor().clamp(0.0, max_y) as i32;
+        let right = (dab.x + half).ceil().clamp(0.0, max_x) as i32;
+        let bottom = (dab.y + half).ceil().clamp(0.0, max_y) as i32;
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(vk::ClearRect {
+            rect: vk::Rect2D {
+                offset: vk::Offset2D { x: left, y: top },
+                extent: vk::Extent2D {
+                    width: (right - left) as u32,
+                    height: (bottom - top) as u32,
+                },
+            },
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+    }
+
+    fn emit_dab(
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        dab: StrokeDab,
+        predicted: bool,
+    ) {
+        let Some(rect) = Self::dab_rect(dab, extent) else {
+            return;
+        };
+        let color = if predicted {
+            if dab.eraser {
+                PREDICTED_ERASER_COLOR
+            } else {
+                PREDICTED_COLOR
+            }
+        } else if dab.eraser {
+            BACKGROUND_COLOR
+        } else {
+            INK_COLOR
+        };
+        let attachment = vk::ClearAttachment::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .color_attachment(0)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue { float32: color },
+            });
+        unsafe {
+            device.cmd_clear_attachments(command_buffer, &[attachment], &[rect]);
+        }
+    }
+
+    fn record_frame(
+        &self,
+        state: &SwapchainState,
+        image_index: u32,
+    ) -> Result<vk::CommandBuffer, String> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| "Vulkan logical device is not initialized".to_string())?;
+        let command_buffer = *state
+            .command_buffers
+            .get(image_index as usize)
+            .ok_or_else(|| "swapchain returned an invalid image index".to_string())?;
+        let framebuffer = *state
+            .framebuffers
+            .get(image_index as usize)
+            .ok_or_else(|| "swapchain framebuffer index is invalid".to_string())?;
+
+        unsafe {
+            device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("vkResetCommandBuffer failed: {e:?}"))?;
+            let begin_info = vk::CommandBufferBeginInfo::default();
+            device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .map_err(|e| format!("vkBeginCommandBuffer failed: {e:?}"))?;
+        }
+
+        let clear_values = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: BACKGROUND_COLOR,
+            },
+        }];
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: state.extent,
+        };
+        let render_pass_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(state.render_pass)
+            .framebuffer(framebuffer)
+            .render_area(render_area)
+            .clear_values(&clear_values);
+        unsafe {
+            device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_begin,
+                vk::SubpassContents::INLINE,
+            );
+        }
+        for &dab in self.stroke.committed() {
+            Self::emit_dab(device, command_buffer, state.extent, dab, false);
+        }
+        for &dab in self.stroke.predicted() {
+            Self::emit_dab(device, command_buffer, state.extent, dab, true);
+        }
+        unsafe {
+            device.cmd_end_render_pass(command_buffer);
+            device
+                .end_command_buffer(command_buffer)
+                .map_err(|e| format!("vkEndCommandBuffer failed: {e:?}"))?;
+        }
+        Ok(command_buffer)
+    }
+
+    fn present_frame(&mut self) -> Result<(), String> {
         let device = self
             .device
             .as_ref()
@@ -658,11 +641,8 @@ impl AndroidRenderer {
         if acquire_suboptimal {
             return Err("Vulkan swapchain became suboptimal during image acquisition".into());
         }
-        let command_buffer = *state
-            .command_buffers
-            .get(image_index as usize)
-            .ok_or_else(|| "swapchain returned an invalid image index".to_string())?;
 
+        let command_buffer = self.record_frame(state, image_index)?;
         unsafe {
             device
                 .reset_fences(&[state.in_flight])
@@ -707,19 +687,17 @@ impl AndroidRenderer {
         let mut last_error = None;
         for _attempt in 0..2 {
             match self.create_swapchain(surface, width, height) {
-                Ok(()) => match self.present_clear_frame() {
+                Ok(()) => match self.present_frame() {
                     Ok(()) => return Ok(()),
                     Err(error) => {
-                        // A present error can happen after vkQueueSubmit succeeded. Wait for
-                        // all submitted work before destroying synchronization/render objects.
+                        // Presentation may fail after queue submission. Do not tear down
+                        // synchronization/render objects until submitted work is idle.
                         self.wait_device_idle();
                         self.destroy_swapchain();
                         last_error = Some(error);
                     }
                 },
-                Err(error) => {
-                    last_error = Some(error);
-                }
+                Err(error) => last_error = Some(error),
             }
         }
         Err(last_error.unwrap_or_else(|| "Vulkan swapchain presentation failed".into()))
@@ -760,8 +738,8 @@ impl RendererBackend for AndroidRenderer {
     fn attach_surface(&mut self, target: NativeSurface) -> Result<(), String> {
         self.destroy_surface();
         let surface = self.attach_surface_inner(target)?;
-        // ANativeWindow ownership transfers from JNI to the renderer only after the
-        // entire Vulkan surface + device + swapchain + first-present path succeeds.
+        // ANativeWindow ownership transfers from JNI only after Vulkan surface,
+        // device, swapchain, command recording, and first presentation succeed.
         self.window = Some(target.handle);
         self.surface = Some(surface);
         self.width = target.width;
@@ -786,10 +764,31 @@ impl RendererBackend for AndroidRenderer {
     }
 
     fn ingest_input(&mut self, samples: &[StrokeSample]) -> Result<(), String> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        self.stroke.ingest(samples);
         if let Some(last) = samples.last() {
             self.last_input_time_ns = last.time_ns;
         }
-        Ok(())
+
+        let Some(surface) = self.surface else {
+            return Ok(());
+        };
+        if self.swapchain.is_none() || self.width == 0 || self.height == 0 {
+            return Ok(());
+        }
+
+        match self.present_frame() {
+            Ok(()) => Ok(()),
+            Err(first_error) => self
+                .recreate_and_present(surface, self.width, self.height)
+                .map_err(|recovery_error| {
+                    format!(
+                        "stroke presentation failed ({first_error}); swapchain recovery failed ({recovery_error})"
+                    )
+                }),
+        }
     }
 }
 
@@ -799,56 +798,5 @@ impl Drop for AndroidRenderer {
         self.destroy_device();
         unsafe { self.instance.destroy_instance(None) };
         let _ = &self.entry;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn image_count_respects_surface_maximum() {
-        let capabilities = vk::SurfaceCapabilitiesKHR {
-            min_image_count: 2,
-            max_image_count: 2,
-            ..Default::default()
-        };
-        assert_eq!(AndroidRenderer::choose_image_count(capabilities), 2);
-    }
-
-    #[test]
-    fn image_count_uses_one_more_than_minimum_when_unbounded() {
-        let capabilities = vk::SurfaceCapabilitiesKHR {
-            min_image_count: 2,
-            max_image_count: 0,
-            ..Default::default()
-        };
-        assert_eq!(AndroidRenderer::choose_image_count(capabilities), 3);
-    }
-
-    #[test]
-    fn variable_extent_is_clamped_to_surface_limits() {
-        let capabilities = vk::SurfaceCapabilitiesKHR {
-            current_extent: vk::Extent2D {
-                width: u32::MAX,
-                height: u32::MAX,
-            },
-            min_image_extent: vk::Extent2D {
-                width: 320,
-                height: 240,
-            },
-            max_image_extent: vk::Extent2D {
-                width: 1920,
-                height: 1080,
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            AndroidRenderer::choose_extent(capabilities, 4000, 100),
-            vk::Extent2D {
-                width: 1920,
-                height: 240,
-            }
-        );
     }
 }

@@ -45,7 +45,7 @@ impl AndroidRenderer {
             .application_version(vk::make_api_version(0, 0, 1, 0))
             .engine_name(engine_name)
             .engine_version(vk::make_api_version(0, 0, 1, 0))
-            .api_version(vk::API_VERSION_1_1);
+            .api_version(vk::API_VERSION_1_0);
         let extensions = [
             khr::surface::NAME.as_ptr(),
             khr::android_surface::NAME.as_ptr(),
@@ -296,6 +296,12 @@ impl AndroidRenderer {
                 .get_physical_device_surface_capabilities(physical_device, surface)
         }
         .map_err(|e| format!("surface capability query failed: {e:?}"))?;
+        if !capabilities
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        {
+            return Err("Vulkan surface cannot be used as a color attachment".into());
+        }
         let formats = unsafe {
             self.surface_loader
                 .get_physical_device_surface_formats(physical_device, surface)
@@ -640,7 +646,7 @@ impl AndroidRenderer {
                 .wait_for_fences(&[state.in_flight], true, u64::MAX)
                 .map_err(|e| format!("vkWaitForFences failed: {e:?}"))?;
         }
-        let (image_index, _suboptimal) = unsafe {
+        let (image_index, acquire_suboptimal) = unsafe {
             state.loader.acquire_next_image(
                 state.swapchain,
                 u64::MAX,
@@ -649,6 +655,9 @@ impl AndroidRenderer {
             )
         }
         .map_err(|e| format!("vkAcquireNextImageKHR failed: {e:?}"))?;
+        if acquire_suboptimal {
+            return Err("Vulkan swapchain became suboptimal during image acquisition".into());
+        }
         let command_buffer = *state
             .command_buffers
             .get(image_index as usize)
@@ -681,9 +690,39 @@ impl AndroidRenderer {
             .wait_semaphores(&present_wait)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
-        unsafe { state.loader.queue_present(queue, &present_info) }
+        let present_suboptimal = unsafe { state.loader.queue_present(queue, &present_info) }
             .map_err(|e| format!("vkQueuePresentKHR failed: {e:?}"))?;
+        if present_suboptimal {
+            return Err("Vulkan swapchain became suboptimal during presentation".into());
+        }
         Ok(())
+    }
+
+    fn recreate_and_present(
+        &mut self,
+        surface: vk::SurfaceKHR,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let mut last_error = None;
+        for _attempt in 0..2 {
+            match self.create_swapchain(surface, width, height) {
+                Ok(()) => match self.present_clear_frame() {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        // A present error can happen after vkQueueSubmit succeeded. Wait for
+                        // all submitted work before destroying synchronization/render objects.
+                        self.wait_device_idle();
+                        self.destroy_swapchain();
+                        last_error = Some(error);
+                    }
+                },
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "Vulkan swapchain presentation failed".into()))
     }
 
     fn attach_surface_inner(&mut self, target: NativeSurface) -> Result<vk::SurfaceKHR, String> {
@@ -709,12 +748,7 @@ impl AndroidRenderer {
             unsafe { self.surface_loader.destroy_surface(surface, None) };
             return Err(error);
         }
-        if let Err(error) = self.create_swapchain(surface, target.width, target.height) {
-            unsafe { self.surface_loader.destroy_surface(surface, None) };
-            return Err(error);
-        }
-        if let Err(error) = self.present_clear_frame() {
-            self.destroy_swapchain();
+        if let Err(error) = self.recreate_and_present(surface, target.width, target.height) {
             unsafe { self.surface_loader.destroy_surface(surface, None) };
             return Err(error);
         }
@@ -746,8 +780,7 @@ impl RendererBackend for AndroidRenderer {
         self.width = width;
         self.height = height;
         if let Some(surface) = self.surface {
-            self.create_swapchain(surface, width, height)?;
-            self.present_clear_frame()?;
+            self.recreate_and_present(surface, width, height)?;
         }
         Ok(())
     }

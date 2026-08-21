@@ -82,10 +82,14 @@ Not implemented yet:
 
 That distinction is intentional: the repository should never claim a rendered brush path before one actually exists.
 
+## Android SDK policy
+
+The production/publishable branch is pinned to Android 16 / API 36 for both `compileSdk` and `targetSdk`. Android 17 / API 37 can be evaluated on a separate preview branch, but preview SDK availability must never block the shipping build or CI.
+
 ## Build prerequisites
 
 - JDK 17
-- Android SDK Platform 37
+- Android SDK Platform 36
 - Android NDK `28.2.13676358`
 - Rust stable
 - Rust Android targets `aarch64-linux-android` and `x86_64-linux-android`

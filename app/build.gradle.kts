@@ -5,7 +5,9 @@ plugins {
 
 android {
     namespace = "com.inkframe.studio"
-    compileSdk = 37
+    // Production builds remain on Android 16. Newer AndroidX releases that
+    // require API 36.1/37 are pinned below until those SDKs are shipping-safe.
+    compileSdk = 36
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
@@ -59,10 +61,12 @@ tasks.matching { it.name == "mergeReleaseJniLibFolders" }.configureEach {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.19.0")
+    // Core 1.18+ raises its compileSdk floor above API 36; 1.17.0 is the
+    // newest production-safe Core line for this Android 16 shipping baseline.
+    implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.activity:activity-compose:1.13.0")
 
-    val composeBom = platform("androidx.compose:compose-bom:2026.08.00")
+    val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 

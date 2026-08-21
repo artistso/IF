@@ -45,7 +45,10 @@ impl fmt::Display for DecodeError {
         match self {
             Self::CountOverflow => write!(f, "sample count overflows packet size"),
             Self::BufferTooSmall { required, actual } => {
-                write!(f, "sample packet requires {required} bytes but buffer has {actual}")
+                write!(
+                    f,
+                    "sample packet requires {required} bytes but buffer has {actual}"
+                )
             }
             Self::NonFiniteSample { index } => write!(f, "sample {index} contains NaN/Infinity"),
         }
@@ -54,7 +57,10 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-pub fn decode_stroke_samples(bytes: &[u8], sample_count: usize) -> Result<Vec<StrokeSample>, DecodeError> {
+pub fn decode_stroke_samples(
+    bytes: &[u8],
+    sample_count: usize,
+) -> Result<Vec<StrokeSample>, DecodeError> {
     let required = sample_count
         .checked_mul(STROKE_SAMPLE_STRIDE)
         .ok_or(DecodeError::CountOverflow)?;
@@ -323,8 +329,20 @@ mod tests {
     #[test]
     fn exposure_hold_resolves_latest_preceding_cel() {
         let mut cels = BTreeMap::new();
-        cels.insert(2, Cel { surface_id: 10, transform: CelTransform::default() });
-        cels.insert(8, Cel { surface_id: 20, transform: CelTransform::default() });
+        cels.insert(
+            2,
+            Cel {
+                surface_id: 10,
+                transform: CelTransform::default(),
+            },
+        );
+        cels.insert(
+            8,
+            Cel {
+                surface_id: 20,
+                transform: CelTransform::default(),
+            },
+        );
         let layer = Layer {
             id: 1,
             name: "Layer 1".into(),

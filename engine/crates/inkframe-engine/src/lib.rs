@@ -6,9 +6,13 @@ use std::thread::{self, JoinHandle};
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
+type LifecycleReply = SyncSender<Result<(), String>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSurface {
-    /// Platform handle encoded as an integer. The platform renderer owns the referenced object.
+    /// Platform handle encoded as an integer. Ownership remains with the caller while
+    /// attach is being attempted and transfers to the renderer only after attach succeeds.
+    /// On a failed attach, the caller remains responsible for releasing the platform object.
     pub handle: usize,
     pub width: u32,
     pub height: u32,
@@ -16,9 +20,18 @@ pub struct NativeSurface {
 
 #[derive(Debug)]
 pub enum EngineCommand {
-    AttachSurface(NativeSurface),
-    DetachSurface,
-    Resize { width: u32, height: u32 },
+    AttachSurface {
+        surface: NativeSurface,
+        reply: LifecycleReply,
+    },
+    DetachSurface {
+        reply: LifecycleReply,
+    },
+    Resize {
+        width: u32,
+        height: u32,
+        reply: LifecycleReply,
+    },
     Input(Vec<StrokeSample>),
     Shutdown,
 }
@@ -42,17 +55,27 @@ pub trait RendererBackend: Send + 'static {
 pub struct NullRenderer;
 
 impl RendererBackend for NullRenderer {
-    fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> { Ok(()) }
+    fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> {
+        Ok(())
+    }
+
     fn detach_surface(&mut self) {}
-    fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> { Ok(()) }
-    fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> { Ok(()) }
+
+    fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
     Backpressure,
     Stopped,
     InvalidSurfaceSize,
+    Renderer(String),
 }
 
 impl fmt::Display for SubmitError {
@@ -61,6 +84,7 @@ impl fmt::Display for SubmitError {
             Self::Backpressure => write!(f, "engine command queue is full"),
             Self::Stopped => write!(f, "engine thread has stopped"),
             Self::InvalidSurfaceSize => write!(f, "surface dimensions must be non-zero"),
+            Self::Renderer(message) => write!(f, "renderer rejected lifecycle command: {message}"),
         }
     }
 }
@@ -93,22 +117,35 @@ impl EngineHost {
         }
     }
 
+    /// Lifecycle operations are acknowledged by the renderer. Unlike high-rate stylus
+    /// input, attach/detach/resize are never discarded because the bounded command queue
+    /// is temporarily full: Android surface ownership must remain exact under input load.
     pub fn attach_surface(&self, surface: NativeSurface) -> Result<(), SubmitError> {
         if surface.width == 0 || surface.height == 0 {
             return Err(SubmitError::InvalidSurfaceSize);
         }
-        self.send(EngineCommand::AttachSurface(surface))
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send_lifecycle(EngineCommand::AttachSurface { surface, reply })?;
+        Self::await_lifecycle(receiver)
     }
 
     pub fn detach_surface(&self) -> Result<(), SubmitError> {
-        self.send(EngineCommand::DetachSurface)
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send_lifecycle(EngineCommand::DetachSurface { reply })?;
+        Self::await_lifecycle(receiver)
     }
 
     pub fn resize(&self, width: u32, height: u32) -> Result<(), SubmitError> {
         if width == 0 || height == 0 {
             return Err(SubmitError::InvalidSurfaceSize);
         }
-        self.send(EngineCommand::Resize { width, height })
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send_lifecycle(EngineCommand::Resize {
+            width,
+            height,
+            reply,
+        })?;
+        Self::await_lifecycle(receiver)
     }
 
     pub fn submit_input(&self, samples: Vec<StrokeSample>) -> Result<(), SubmitError> {
@@ -129,11 +166,15 @@ impl EngineHost {
         *self.stats.lock().unwrap()
     }
 
-    fn send(&self, command: EngineCommand) -> Result<(), SubmitError> {
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SubmitError::Backpressure),
-            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Stopped),
+    fn send_lifecycle(&self, command: EngineCommand) -> Result<(), SubmitError> {
+        self.sender.send(command).map_err(|_| SubmitError::Stopped)
+    }
+
+    fn await_lifecycle(receiver: Receiver<Result<(), String>>) -> Result<(), SubmitError> {
+        match receiver.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(SubmitError::Renderer(message)),
+            Err(_) => Err(SubmitError::Stopped),
         }
     }
 }
@@ -147,34 +188,50 @@ impl Drop for EngineHost {
     }
 }
 
+fn note_renderer_error(stats: &Arc<Mutex<EngineStats>>, result: &Result<(), String>) {
+    if result.is_err() {
+        stats.lock().unwrap().renderer_errors += 1;
+    }
+}
+
 fn run_engine<R: RendererBackend>(
     receiver: Receiver<EngineCommand>,
     mut renderer: R,
     stats: Arc<Mutex<EngineStats>>,
 ) {
     while let Ok(command) = receiver.recv() {
-        let result = match command {
-            EngineCommand::AttachSurface(surface) => renderer.attach_surface(surface),
-            EngineCommand::DetachSurface => {
-                renderer.detach_surface();
-                Ok(())
+        match command {
+            EngineCommand::AttachSurface { surface, reply } => {
+                let result = renderer.attach_surface(surface);
+                note_renderer_error(&stats, &result);
+                let _ = reply.send(result);
             }
-            EngineCommand::Resize { width, height } => renderer.resize(width, height),
+            EngineCommand::DetachSurface { reply } => {
+                renderer.detach_surface();
+                let _ = reply.send(Ok(()));
+            }
+            EngineCommand::Resize {
+                width,
+                height,
+                reply,
+            } => {
+                let result = renderer.resize(width, height);
+                note_renderer_error(&stats, &result);
+                let _ = reply.send(result);
+            }
             EngineCommand::Input(samples) => {
                 {
                     let mut stats = stats.lock().unwrap();
                     stats.input_packets += 1;
                     stats.input_samples += samples.len() as u64;
                 }
-                renderer.ingest_input(&samples)
+                let result = renderer.ingest_input(&samples);
+                note_renderer_error(&stats, &result);
             }
             EngineCommand::Shutdown => {
                 renderer.detach_surface();
                 break;
             }
-        };
-        if result.is_err() {
-            stats.lock().unwrap().renderer_errors += 1;
         }
     }
 }
@@ -184,13 +241,51 @@ mod tests {
     use super::*;
     use inkframe_core::sample_flags;
 
+    #[derive(Default)]
+    struct RejectingRenderer;
+
+    impl RendererBackend for RejectingRenderer {
+        fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> {
+            Err("test surface rejection".into())
+        }
+
+        fn detach_surface(&mut self) {}
+
+        fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+            Err("test resize rejection".into())
+        }
+
+        fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn rejects_zero_sized_surfaces() {
         let engine = EngineHost::spawn(NullRenderer);
         assert_eq!(
-            engine.attach_surface(NativeSurface { handle: 1, width: 0, height: 10 }),
+            engine.attach_surface(NativeSurface {
+                handle: 1,
+                width: 0,
+                height: 10,
+            }),
             Err(SubmitError::InvalidSurfaceSize)
         );
+    }
+
+    #[test]
+    fn lifecycle_returns_renderer_result() {
+        let engine = EngineHost::spawn(RejectingRenderer);
+        let result = engine.attach_surface(NativeSurface {
+            handle: 1,
+            width: 100,
+            height: 100,
+        });
+        assert_eq!(
+            result,
+            Err(SubmitError::Renderer("test surface rejection".into()))
+        );
+        assert_eq!(engine.stats().renderer_errors, 1);
     }
 
     #[test]

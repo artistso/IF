@@ -1,4 +1,4 @@
-use crate::stroke::{StrokeDab, StrokePreview};
+use crate::stroke::{MAX_BOOTSTRAP_DABS, StrokeDab, StrokePreview};
 use ash::{Device, Entry, Instance, khr, vk};
 use inkframe_core::StrokeSample;
 use inkframe_engine::{NativeSurface, RendererBackend};
@@ -596,7 +596,15 @@ impl AndroidRenderer {
                 vk::SubpassContents::INLINE,
             );
         }
-        for &dab in self.stroke.committed() {
+        // The state layer already hard-caps committed dabs, and the renderer
+        // repeats the bound defensively so command recording can never grow
+        // with the entire document history during this bootstrap milestone.
+        for &dab in self
+            .stroke
+            .committed()
+            .iter()
+            .take(MAX_BOOTSTRAP_DABS)
+        {
             Self::emit_dab(device, command_buffer, state.extent, dab, false);
         }
         for &dab in self.stroke.predicted() {
@@ -775,8 +783,15 @@ impl RendererBackend for AndroidRenderer {
         let Some(surface) = self.surface else {
             return Ok(());
         };
-        if self.swapchain.is_none() || self.width == 0 || self.height == 0 {
+        if self.width == 0 || self.height == 0 {
             return Ok(());
+        }
+
+        // A previous transient failure may have torn down the swapchain. Keep
+        // retrying from fresh stylus input instead of silently remaining blank
+        // until Android happens to deliver another lifecycle callback.
+        if self.swapchain.is_none() {
+            return self.recreate_and_present(surface, self.width, self.height);
         }
 
         match self.present_frame() {

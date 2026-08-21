@@ -400,7 +400,10 @@ mod tests {
         preview.ingest(&[sample(8.0, 0.5, sample_flags::UP, 3)]);
         assert!(preview.raster().tile_count() > 0);
         assert!(preview.raster().pixel_rgba(4, 10)[3] > 0);
-        assert_eq!(preview.raster_tile_coords().count(), preview.raster().tile_count());
+        assert_eq!(
+            preview.raster_tile_coords().count(),
+            preview.raster().tile_count()
+        );
     }
 
     #[test]

@@ -64,7 +64,9 @@ dependencies {
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.activity:activity-compose:1.13.0")
 
-    val composeBom = platform("androidx.compose:compose-bom:2026.08.00")
+    // Compose 1.12 raises the compileSdk floor to API 37. Keep the production
+    // Android 16 / API 36 build on the last stable pre-1.12 BOM.
+    val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 

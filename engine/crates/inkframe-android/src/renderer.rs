@@ -599,12 +599,7 @@ impl AndroidRenderer {
         // The state layer already hard-caps committed dabs, and the renderer
         // repeats the bound defensively so command recording can never grow
         // with the entire document history during this bootstrap milestone.
-        for &dab in self
-            .stroke
-            .committed()
-            .iter()
-            .take(MAX_BOOTSTRAP_DABS)
-        {
+        for &dab in self.stroke.committed().iter().take(MAX_BOOTSTRAP_DABS) {
             Self::emit_dab(device, command_buffer, state.extent, dab, false);
         }
         for &dab in self.stroke.predicted() {

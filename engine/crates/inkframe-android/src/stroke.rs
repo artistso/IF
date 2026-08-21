@@ -3,6 +3,11 @@ use inkframe_core::{Brush, StrokeSample, sample_flags};
 const MAX_DABS_PER_SEGMENT: usize = 4096;
 const MIN_SPACING_PX: f32 = 0.75;
 const MAX_SPACING_PX: f32 = 4.0;
+/// Temporary safety bound for the first-present brush proof. Until completed
+/// strokes are flattened into sparse raster tiles, the oldest bootstrap dabs
+/// roll off instead of allowing frame-recording cost and memory to grow forever.
+pub(crate) const MAX_BOOTSTRAP_DABS: usize = 4096;
+const MAX_PREDICTED_DABS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StrokeDab {
@@ -67,6 +72,7 @@ impl StrokePreview {
                         predicted_anchor,
                         sample,
                     );
+                    Self::trim_front(&mut self.predicted, MAX_PREDICTED_DABS);
                     predicted_anchor = Some(sample);
                 }
                 continue;
@@ -83,6 +89,7 @@ impl StrokePreview {
 
             let previous = self.last_actual;
             Self::append_segment(&self.brush, &mut self.committed, previous, sample);
+            self.enforce_committed_limit();
             self.last_actual = Some(sample);
             predicted_anchor = self.last_actual;
 
@@ -100,6 +107,24 @@ impl StrokePreview {
         }
         self.last_actual = None;
         self.predicted.clear();
+    }
+
+    fn enforce_committed_limit(&mut self) {
+        let overflow = self.committed.len().saturating_sub(MAX_BOOTSTRAP_DABS);
+        if overflow == 0 {
+            return;
+        }
+        self.committed.drain(..overflow);
+        if let Some(start) = self.active_stroke_start {
+            self.active_stroke_start = Some(start.saturating_sub(overflow));
+        }
+    }
+
+    fn trim_front(target: &mut Vec<StrokeDab>, limit: usize) {
+        let overflow = target.len().saturating_sub(limit);
+        if overflow > 0 {
+            target.drain(..overflow);
+        }
     }
 
     fn append_segment(
@@ -231,5 +256,16 @@ mod tests {
                 .iter()
                 .all(|dab| dab.x <= 1.0 || dab.x >= 99.0)
         );
+    }
+
+    #[test]
+    fn committed_bootstrap_replay_is_hard_bounded() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[
+            sample(0.0, 0.5, sample_flags::DOWN, 1),
+            sample(50_000.0, 0.5, sample_flags::MOVE, 2),
+        ]);
+
+        assert_eq!(preview.committed().len(), MAX_BOOTSTRAP_DABS);
     }
 }

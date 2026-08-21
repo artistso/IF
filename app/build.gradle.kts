@@ -5,7 +5,9 @@ plugins {
 
 android {
     namespace = "com.inkframe.studio"
-    compileSdk = 37
+    // Keep the publishable app on the stable Android 16 SDK. Android 17 / API 37
+    // is still a preview channel and is not reliably available to headless CI.
+    compileSdk = 36
     ndkVersion = "28.2.13676358"
 
     defaultConfig {

@@ -5,9 +5,9 @@ plugins {
 
 android {
     namespace = "com.inkframe.studio"
-    // Keep the publishable app on the stable Android 16 SDK. Android 17 / API 37
-    // is still a preview channel and is not reliably available to headless CI.
-    compileSdk = 36
+    // Compile against the newest SDK required by current AndroidX while keeping
+    // targetSdk 36 until Android 17 runtime behavior is intentionally adopted.
+    compileSdk = 37
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
@@ -64,8 +64,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.activity:activity-compose:1.13.0")
 
-    // Compose 1.12 raises the compileSdk floor to API 37. Keep the production
-    // Android 16 / API 36 build on the last stable pre-1.12 BOM.
     val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)

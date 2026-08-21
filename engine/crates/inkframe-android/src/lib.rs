@@ -7,3 +7,5 @@ mod viewport_pixels;
 mod android;
 #[cfg(target_os = "android")]
 mod renderer;
+#[cfg(target_os = "android")]
+mod viewport;

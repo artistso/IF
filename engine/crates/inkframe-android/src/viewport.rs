@@ -82,7 +82,9 @@ impl ViewportCache {
                 device.free_memory(memory, None);
                 device.destroy_image(image, None);
             }
-            return Err(format!("vkBindImageMemory(viewport cache) failed: {error:?}"));
+            return Err(format!(
+                "vkBindImageMemory(viewport cache) failed: {error:?}"
+            ));
         }
 
         let cache = Self {
@@ -148,12 +150,9 @@ impl ViewportCache {
         let mut copies = Vec::new();
 
         for (coord, dirty, pixels) in tiles {
-            let Some(region) = clip_tile_region(
-                coord,
-                dirty,
-                self.extent.width,
-                self.extent.height,
-            ) else {
+            let Some(region) =
+                clip_tile_region(coord, dirty, self.extent.width, self.extent.height)
+            else {
                 continue;
             };
             let base_offset = staging_bytes.len() as vk::DeviceSize;
@@ -420,8 +419,8 @@ where
         .command_buffer_count(1);
     let command_buffer = unsafe { device.allocate_command_buffers(&allocation) }
         .map_err(|e| format!("vkAllocateCommandBuffers(immediate) failed: {e:?}"))?[0];
-    let begin = vk::CommandBufferBeginInfo::default()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe {
         device
             .begin_command_buffer(command_buffer, &begin)

@@ -675,11 +675,7 @@ impl AndroidRenderer {
         })
     }
 
-    fn clear_background(
-        device: &Device,
-        command_buffer: vk::CommandBuffer,
-        extent: vk::Extent2D,
-    ) {
+    fn clear_background(device: &Device, command_buffer: vk::CommandBuffer, extent: vk::Extent2D) {
         let attachment = vk::ClearAttachment::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .color_attachment(0)
@@ -854,9 +850,8 @@ impl AndroidRenderer {
         let wait_semaphores = [state.image_available];
         // Persistent frames touch the acquired image in TRANSFER before the
         // overlay render pass, so acquisition must be visible to both stages.
-        let wait_stages = [
-            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-        ];
+        let wait_stages =
+            [vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let command_buffers = [command_buffer];
         let signal_semaphores = [state.render_finished];
         let submit_info = vk::SubmitInfo::default()

@@ -166,9 +166,7 @@ impl SparseRaster {
         tile.pixels[index..index + 4].try_into().unwrap()
     }
 
-    pub fn dirty_tiles(
-        &self,
-    ) -> impl Iterator<Item = (TileCoord, DirtyRect, &[u8])> + '_ {
+    pub fn dirty_tiles(&self) -> impl Iterator<Item = (TileCoord, DirtyRect, &[u8])> + '_ {
         self.tiles.iter().filter_map(|(coord, tile)| {
             tile.dirty_rect()
                 .map(|dirty| (*coord, dirty, tile.pixels()))
@@ -199,9 +197,7 @@ impl SparseRaster {
             return;
         }
 
-        let diameter = dab
-            .diameter
-            .clamp(MIN_DAB_DIAMETER_PX, MAX_DAB_DIAMETER_PX);
+        let diameter = dab.diameter.clamp(MIN_DAB_DIAMETER_PX, MAX_DAB_DIAMETER_PX);
         let radius = diameter * 0.5;
         // One pixel of analytical feathering keeps the CPU persistence layer from
         // producing visibly jagged tile-edge circles before the final GPU brush path.

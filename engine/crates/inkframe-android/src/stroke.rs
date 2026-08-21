@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
+
 use inkframe_core::{Brush, StrokeSample, sample_flags};
-use inkframe_raster::{RasterDab, SparseRaster, StrokeScratch, StrokeStyle};
+use inkframe_raster::{RasterDab, SparseRaster, StrokeScratch, StrokeStyle, TileCoord};
 
 const MAX_DABS_PER_SEGMENT: usize = 4096;
 const MIN_SPACING_PX: f32 = 0.75;
@@ -38,6 +40,7 @@ pub(crate) struct StrokePreview {
     last_actual: Option<StrokeSample>,
     active_stroke_start: Option<usize>,
     raster: SparseRaster,
+    raster_tile_coords: BTreeSet<TileCoord>,
     active_raster_stroke: Option<ActiveRasterStroke>,
 }
 
@@ -57,6 +60,7 @@ impl StrokePreview {
             last_actual: None,
             active_stroke_start: None,
             raster: SparseRaster::new(),
+            raster_tile_coords: BTreeSet::new(),
             active_raster_stroke: None,
         }
     }
@@ -65,15 +69,33 @@ impl StrokePreview {
         &self.committed
     }
 
+    /// Only the actual dabs belonging to the currently cancellable stroke.
+    /// Once UP seals a stroke into the persistent raster, this slice is empty.
+    pub(crate) fn active(&self) -> &[StrokeDab] {
+        let Some(start) = self.active_stroke_start else {
+            return &[];
+        };
+        &self.committed[start.min(self.committed.len())..]
+    }
+
     pub(crate) fn predicted(&self) -> &[StrokeDab] {
         &self.predicted
     }
 
     /// Authoritative persistent pixels accumulated from completed actual strokes.
-    /// The Vulkan bootstrap renderer does not consume these tiles yet; that is the
-    /// next integration layer after lifecycle semantics are proven independently.
     pub(crate) fn raster(&self) -> &SparseRaster {
         &self.raster
+    }
+
+    pub(crate) fn raster_mut(&mut self) -> &mut SparseRaster {
+        &mut self.raster
+    }
+
+    /// Coordinates are tracked separately from dirty rectangles so a newly
+    /// created GPU viewport can repopulate current pixels after rotation or
+    /// surface recreation even when all prior dirty regions were acknowledged.
+    pub(crate) fn raster_tile_coords(&self) -> impl Iterator<Item = TileCoord> + '_ {
+        self.raster_tile_coords.iter().copied()
     }
 
     pub(crate) fn ingest(&mut self, samples: &[StrokeSample]) {
@@ -199,6 +221,13 @@ impl StrokePreview {
                 self.raster.apply_stroke(dabs, style);
             }
         }
+
+        let changed_coords: Vec<_> = self
+            .raster
+            .dirty_tiles()
+            .map(|(coord, _, _)| coord)
+            .collect();
+        self.raster_tile_coords.extend(changed_coords);
     }
 
     fn cancel_active_stroke(&mut self) {
@@ -305,6 +334,19 @@ mod tests {
     }
 
     #[test]
+    fn active_dabs_are_empty_after_up() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[
+            sample(0.0, 0.5, sample_flags::DOWN, 1),
+            sample(8.0, 0.5, sample_flags::MOVE, 2),
+        ]);
+        assert!(!preview.active().is_empty());
+
+        preview.ingest(&[sample(8.0, 0.5, sample_flags::UP, 3)]);
+        assert!(preview.active().is_empty());
+    }
+
+    #[test]
     fn predicted_dabs_are_replaced_not_committed() {
         let mut preview = StrokePreview::default();
         preview.ingest(&[sample(0.0, 0.5, sample_flags::DOWN, 1)]);
@@ -358,6 +400,7 @@ mod tests {
         preview.ingest(&[sample(8.0, 0.5, sample_flags::UP, 3)]);
         assert!(preview.raster().tile_count() > 0);
         assert!(preview.raster().pixel_rgba(4, 10)[3] > 0);
+        assert_eq!(preview.raster_tile_coords().count(), preview.raster().tile_count());
     }
 
     #[test]

@@ -118,20 +118,20 @@ impl EngineHost {
     }
 
     /// Lifecycle operations are acknowledged by the renderer. Unlike high-rate stylus
-    /// input, attach/detach/resize must not report success merely because a command was
-    /// queued: Android uses the result to decide whether the native surface is usable.
+    /// input, attach/detach/resize are never discarded because the bounded command queue
+    /// is temporarily full: Android surface ownership must remain exact under input load.
     pub fn attach_surface(&self, surface: NativeSurface) -> Result<(), SubmitError> {
         if surface.width == 0 || surface.height == 0 {
             return Err(SubmitError::InvalidSurfaceSize);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.try_send(EngineCommand::AttachSurface { surface, reply })?;
+        self.send_lifecycle(EngineCommand::AttachSurface { surface, reply })?;
         Self::await_lifecycle(receiver)
     }
 
     pub fn detach_surface(&self) -> Result<(), SubmitError> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.try_send(EngineCommand::DetachSurface { reply })?;
+        self.send_lifecycle(EngineCommand::DetachSurface { reply })?;
         Self::await_lifecycle(receiver)
     }
 
@@ -140,7 +140,7 @@ impl EngineHost {
             return Err(SubmitError::InvalidSurfaceSize);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.try_send(EngineCommand::Resize {
+        self.send_lifecycle(EngineCommand::Resize {
             width,
             height,
             reply,
@@ -166,12 +166,8 @@ impl EngineHost {
         *self.stats.lock().unwrap()
     }
 
-    fn try_send(&self, command: EngineCommand) -> Result<(), SubmitError> {
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SubmitError::Backpressure),
-            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Stopped),
-        }
+    fn send_lifecycle(&self, command: EngineCommand) -> Result<(), SubmitError> {
+        self.sender.send(command).map_err(|_| SubmitError::Stopped)
     }
 
     fn await_lifecycle(receiver: Receiver<Result<(), String>>) -> Result<(), SubmitError> {

@@ -91,12 +91,12 @@ pub(crate) fn encode_opaque_tile(
         let inverse_alpha = 255_u16 - alpha;
         // The document raster is premultiplied already, so compositing it over
         // the opaque workspace background is src + bg * (1 - alpha).
-        let r = (src[0] as u16 + (background_rgb[0] as u16 * inverse_alpha + 127) / 255)
-            .min(255) as u8;
-        let g = (src[1] as u16 + (background_rgb[1] as u16 * inverse_alpha + 127) / 255)
-            .min(255) as u8;
-        let b = (src[2] as u16 + (background_rgb[2] as u16 * inverse_alpha + 127) / 255)
-            .min(255) as u8;
+        let r =
+            (src[0] as u16 + (background_rgb[0] as u16 * inverse_alpha + 127) / 255).min(255) as u8;
+        let g =
+            (src[1] as u16 + (background_rgb[1] as u16 * inverse_alpha + 127) / 255).min(255) as u8;
+        let b =
+            (src[2] as u16 + (background_rgb[2] as u16 * inverse_alpha + 127) / 255).min(255) as u8;
         match order {
             PixelOrder::Rgba => dst.copy_from_slice(&[r, g, b, 255]),
             PixelOrder::Bgra => dst.copy_from_slice(&[b, g, r, 255]),
@@ -111,15 +111,7 @@ mod tests {
 
     #[test]
     fn negative_tiles_are_offscreen_without_overflow() {
-        assert!(
-            clip_tile_region(
-                TileCoord { x: -1, y: 0 },
-                full_tile_rect(),
-                100,
-                100,
-            )
-            .is_none()
-        );
+        assert!(clip_tile_region(TileCoord { x: -1, y: 0 }, full_tile_rect(), 100, 100,).is_none());
         assert!(
             clip_tile_region(
                 TileCoord {
@@ -136,13 +128,8 @@ mod tests {
 
     #[test]
     fn positive_edge_tile_clips_to_screen_bounds() {
-        let region = clip_tile_region(
-            TileCoord { x: 1, y: 0 },
-            full_tile_rect(),
-            300,
-            200,
-        )
-        .unwrap();
+        let region =
+            clip_tile_region(TileCoord { x: 1, y: 0 }, full_tile_rect(), 300, 200).unwrap();
         assert_eq!(region.local_x, 0);
         assert_eq!(region.image_x, 256);
         assert_eq!(region.width, 44);

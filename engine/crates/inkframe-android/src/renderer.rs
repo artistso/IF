@@ -189,8 +189,11 @@ impl AndroidRenderer {
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extensions);
-        let device = unsafe { self.instance.create_device(physical_device, &create_info, None) }
-            .map_err(|e| format!("vkCreateDevice failed: {e:?}"))?;
+        let device = unsafe {
+            self.instance
+                .create_device(physical_device, &create_info, None)
+        }
+        .map_err(|e| format!("vkCreateDevice failed: {e:?}"))?;
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         self.physical_device = Some(physical_device);
@@ -200,7 +203,9 @@ impl AndroidRenderer {
         Ok(())
     }
 
-    fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Result<vk::SurfaceFormatKHR, String> {
+    fn choose_surface_format(
+        formats: &[vk::SurfaceFormatKHR],
+    ) -> Result<vk::SurfaceFormatKHR, String> {
         if formats.is_empty() {
             return Err("Vulkan surface exposes no image formats".into());
         }
@@ -496,7 +501,8 @@ impl AndroidRenderer {
 
         for (&command_buffer, &framebuffer) in command_buffers.iter().zip(&framebuffers) {
             let begin_info = vk::CommandBufferBeginInfo::default();
-            if let Err(error) = unsafe { device.begin_command_buffer(command_buffer, &begin_info) } {
+            if let Err(error) = unsafe { device.begin_command_buffer(command_buffer, &begin_info) }
+            {
                 unsafe { device.destroy_command_pool(command_pool, None) };
                 for framebuffer in framebuffers {
                     unsafe { device.destroy_framebuffer(framebuffer, None) };
@@ -557,7 +563,9 @@ impl AndroidRenderer {
                     unsafe { device.destroy_image_view(view, None) };
                 }
                 unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkCreateSemaphore(image_available) failed: {error:?}"));
+                return Err(format!(
+                    "vkCreateSemaphore(image_available) failed: {error:?}"
+                ));
             }
         };
         let render_finished = match unsafe { device.create_semaphore(&semaphore_info, None) } {
@@ -573,7 +581,9 @@ impl AndroidRenderer {
                     unsafe { device.destroy_image_view(view, None) };
                 }
                 unsafe { loader.destroy_swapchain(swapchain, None) };
-                return Err(format!("vkCreateSemaphore(render_finished) failed: {error:?}"));
+                return Err(format!(
+                    "vkCreateSemaphore(render_finished) failed: {error:?}"
+                ));
             }
         };
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);

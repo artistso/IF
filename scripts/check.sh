@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$ROOT/engine/Cargo.toml"
 
 cargo fmt --manifest-path "$MANIFEST" --all -- --check
-cargo test --manifest-path "$MANIFEST" -p inkframe-core -p inkframe-engine
+cargo test --manifest-path "$MANIFEST" -p inkframe-core -p inkframe-engine -p inkframe-android
 
 # The JNI/Vulkan bridge is cfg(target_os = "android"), so a host-only check does
 # not compile the code that ships in the APK. Check both Android ABIs explicitly

@@ -2,6 +2,10 @@
 
 This milestone proves that the native Rust engine owns a real Android Vulkan presentation path before any brush or document rendering is layered on top.
 
+## Integration status
+
+The native surface lifecycle/JNI foundation has been merged into `main`. This Vulkan milestone is retargeted directly to `main`, so its CI acceptance run validates the renderer against the same base that will receive the merge.
+
 ## Runtime path
 
 ```text

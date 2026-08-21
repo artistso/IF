@@ -3,7 +3,9 @@ use std::ptr;
 use ash::{Device, Instance, vk};
 use inkframe_raster::{DirtyRect, TILE_BYTES, TILE_SIZE, TileCoord};
 
-use crate::viewport_pixels::{PixelOrder, clip_tile_region, encode_opaque_tile};
+use crate::viewport_pixels::{
+    PixelEncoding, PixelOrder, TransferEncoding, clip_tile_region, encode_opaque_tile,
+};
 
 const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -17,14 +19,28 @@ pub(crate) struct ViewportCache {
     image: vk::Image,
     memory: vk::DeviceMemory,
     extent: vk::Extent2D,
-    pixel_order: PixelOrder,
+    encoding: PixelEncoding,
 }
 
 impl ViewportCache {
-    pub(crate) fn pixel_order_for_format(format: vk::Format) -> Option<PixelOrder> {
+    pub(crate) fn pixel_encoding_for_format(format: vk::Format) -> Option<PixelEncoding> {
         match format {
-            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => Some(PixelOrder::Rgba),
-            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => Some(PixelOrder::Bgra),
+            vk::Format::R8G8B8A8_UNORM => Some(PixelEncoding {
+                order: PixelOrder::Rgba,
+                transfer: TransferEncoding::Linear,
+            }),
+            vk::Format::R8G8B8A8_SRGB => Some(PixelEncoding {
+                order: PixelOrder::Rgba,
+                transfer: TransferEncoding::Srgb,
+            }),
+            vk::Format::B8G8R8A8_UNORM => Some(PixelEncoding {
+                order: PixelOrder::Bgra,
+                transfer: TransferEncoding::Linear,
+            }),
+            vk::Format::B8G8R8A8_SRGB => Some(PixelEncoding {
+                order: PixelOrder::Bgra,
+                transfer: TransferEncoding::Srgb,
+            }),
             _ => None,
         }
     }
@@ -39,7 +55,7 @@ impl ViewportCache {
         format: vk::Format,
         background: [f32; 4],
     ) -> Result<Self, String> {
-        let pixel_order = Self::pixel_order_for_format(format)
+        let encoding = Self::pixel_encoding_for_format(format)
             .ok_or_else(|| format!("unsupported persistent viewport format: {format:?}"))?;
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -91,7 +107,7 @@ impl ViewportCache {
             image,
             memory,
             extent,
-            pixel_order,
+            encoding,
         };
         let init_result = submit_immediate(device, queue, command_pool, |command_buffer| unsafe {
             transition_image(
@@ -156,7 +172,7 @@ impl ViewportCache {
                 continue;
             };
             let base_offset = staging_bytes.len() as vk::DeviceSize;
-            let encoded = encode_opaque_tile(pixels, self.pixel_order, background_rgb)
+            let encoded = encode_opaque_tile(pixels, self.encoding, background_rgb)
                 .map_err(str::to_string)?;
             staging_bytes.extend_from_slice(&encoded);
 

@@ -72,8 +72,7 @@ mod tests {
     #[test]
     fn rejects_zero_sized_viewports() {
         assert!(
-            BrushInstance::from_pixels(1.0, 1.0, 4.0, [1.0, 1.0, 1.0, 1.0], 0, 100, 1.0,)
-                .is_none()
+            BrushInstance::from_pixels(1.0, 1.0, 4.0, [1.0, 1.0, 1.0, 1.0], 0, 100, 1.0,).is_none()
         );
     }
 }

@@ -56,8 +56,45 @@ private val InkframeLine = Color(0x55FFFFFF)
 private val InkframeText = Color(0xFFFFF8FA)
 private val InkframeMuted = Color(0xFFD8C2CB)
 
+private const val DefaultInkRgb = 0xC80046
+private val BrushSizes = listOf(4f, 8f, 14f, 24f, 40f, 72f)
+private val BrushOpacities = listOf(1f, 0.75f, 0.5f, 0.25f)
+private val BrushPalette = listOf(
+    BrushSwatch("ROSE", 0xC80046),
+    BrushSwatch("BLUE", 0x2474E8),
+    BrushSwatch("TEAL", 0x008F83),
+    BrushSwatch("PURPLE", 0x7837B8),
+    BrushSwatch("GOLD", 0xC88A00),
+    BrushSwatch("INK", 0x24131B),
+)
+
+private data class BrushSwatch(val name: String, val rgb: Int)
+
+private data class BrushUiState(
+    val colorRgb: Int = DefaultInkRgb,
+    val sizePx: Float = 14f,
+    val opacity: Float = 1f,
+    val eraser: Boolean = false,
+)
+
+private fun displayColor(rgb: Int): Color =
+    Color(0xFF000000L or (rgb.toLong() and 0x00FFFFFFL))
+
+private fun <T> nextValue(values: List<T>, current: T): T {
+    val index = values.indexOf(current)
+    return values[(if (index < 0) 0 else index + 1) % values.size]
+}
+
 @Composable
 fun StudioScreen(engine: NativeEngine) {
+    var brush by remember { mutableStateOf(BrushUiState()) }
+
+    fun requestBrush(next: BrushUiState) {
+        if (engine.setBrush(next.colorRgb, next.sizePx, next.opacity, next.eraser)) {
+            brush = next
+        }
+    }
+
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -75,16 +112,29 @@ fun StudioScreen(engine: NativeEngine) {
             .navigationBarsPadding(),
     ) {
         if (maxWidth >= 840.dp) {
-            OrbitStudioWide(engine)
+            OrbitStudioWide(
+                engine = engine,
+                brush = brush,
+                onBrushChange = ::requestBrush,
+            )
         } else {
-            OrbitStudioCompact(engine)
+            OrbitStudioCompact(
+                engine = engine,
+                brush = brush,
+                onBrushChange = ::requestBrush,
+            )
         }
     }
 }
 
 @Composable
-private fun OrbitStudioWide(engine: NativeEngine) {
+private fun OrbitStudioWide(
+    engine: NativeEngine,
+    brush: BrushUiState,
+    onBrushChange: (BrushUiState) -> Unit,
+) {
     var fanExpanded by remember { mutableStateOf(true) }
+    var colorExpanded by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize()) {
         StudioGlowBackdrop()
@@ -121,7 +171,7 @@ private fun OrbitStudioWide(engine: NativeEngine) {
             verticalArrangement = Arrangement.spacedBy(28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            SideAction("C", "COLOR")
+            SideAction("●", "COLOR", selected = colorExpanded) { colorExpanded = !colorExpanded }
             SideAction("★", "FX")
             SideAction("+", "ACTIONS")
             SideAction("◐", "THEMES")
@@ -129,9 +179,28 @@ private fun OrbitStudioWide(engine: NativeEngine) {
 
         if (fanExpanded) {
             ToolFan(
+                brush = brush,
+                onBrushChange = onBrushChange,
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .offset(x = 92.dp, y = 28.dp),
+            )
+            BrushControlCluster(
+                brush = brush,
+                onBrushChange = onBrushChange,
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .offset(x = 348.dp, y = (-150).dp),
+            )
+        }
+
+        if (colorExpanded) {
+            ColorPalette(
+                brush = brush,
+                onBrushChange = onBrushChange,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .offset(x = (-96).dp, y = (-126).dp),
             )
         }
 
@@ -145,7 +214,11 @@ private fun OrbitStudioWide(engine: NativeEngine) {
 }
 
 @Composable
-private fun OrbitStudioCompact(engine: NativeEngine) {
+private fun OrbitStudioCompact(
+    engine: NativeEngine,
+    brush: BrushUiState,
+    onBrushChange: (BrushUiState) -> Unit,
+) {
     Column(Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
@@ -156,6 +229,10 @@ private fun OrbitStudioCompact(engine: NativeEngine) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("InkFrame", color = InkframeText, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Spacer(Modifier.width(10.dp))
+            GlassPill(if (brush.eraser) "ERASER" else "PEN", selected = brush.eraser)
+            Spacer(Modifier.width(6.dp))
+            GlassPill("${brush.sizePx.toInt()} px")
             Spacer(Modifier.weight(1f))
             GlassPill("ENGINE · V2", selected = true)
             Spacer(Modifier.width(6.dp))
@@ -198,11 +275,21 @@ private fun OrbitStudioCompact(engine: NativeEngine) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
-            CompactDock("TOOLS")
-            CompactDock("COLOR")
-            CompactDock("FRAMES")
+            CompactDock(
+                label = if (brush.eraser) "ERASER" else "PEN",
+                selected = brush.eraser,
+            ) { onBrushChange(brush.copy(eraser = !brush.eraser)) }
+            CompactDock("COLOR", swatch = displayColor(brush.colorRgb)) {
+                val next = nextValue(BrushPalette.map { it.rgb }, brush.colorRgb)
+                onBrushChange(brush.copy(colorRgb = next, eraser = false))
+            }
+            CompactDock("SIZE") {
+                onBrushChange(brush.copy(sizePx = nextValue(BrushSizes, brush.sizePx)))
+            }
+            CompactDock("OPACITY") {
+                onBrushChange(brush.copy(opacity = nextValue(BrushOpacities, brush.opacity)))
+            }
             CompactDock("LAYERS")
-            CompactDock("SELECT")
         }
     }
 }
@@ -472,13 +559,18 @@ private fun SideAction(
 }
 
 @Composable
-private fun ToolFan(modifier: Modifier = Modifier) {
+private fun ToolFan(
+    brush: BrushUiState,
+    onBrushChange: (BrushUiState) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val items = listOf(
         "STYLUS",
         "PALM",
         "TEXT",
         "PICK",
         "PEN",
+        "ERASE",
         "FULL",
         "EXPAND",
         "GIF",
@@ -496,13 +588,13 @@ private fun ToolFan(modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
             .width(300.dp)
-            .height(470.dp),
+            .height(490.dp),
     ) {
         Canvas(Modifier.fillMaxSize()) {
-            val anchor = Offset(238.dp.toPx(), 240.dp.toPx())
+            val anchor = Offset(238.dp.toPx(), 246.dp.toPx())
             items.forEachIndexed { index, _ ->
                 val t = index / (items.size - 1f)
-                val y = 24.dp.toPx() + t * 410.dp.toPx()
+                val y = 24.dp.toPx() + t * 432.dp.toPx()
                 val wave = sin(t * Math.PI).toFloat()
                 val x = (28.dp + (84.dp * wave)).toPx()
                 drawLine(
@@ -520,7 +612,19 @@ private fun ToolFan(modifier: Modifier = Modifier) {
             val wave = sin(t * Math.PI).toFloat()
             val x = 10.dp + 78.dp * wave
             val y = 8.dp + 25.dp * index
-            FanOrb(label, Modifier.offset(x = x, y = y))
+            val selectable = label == "PEN" || label == "ERASE"
+            val selected = (label == "PEN" && !brush.eraser) || (label == "ERASE" && brush.eraser)
+            FanOrb(
+                label = label,
+                selected = selected,
+                enabled = selectable,
+                modifier = Modifier.offset(x = x, y = y),
+            ) {
+                when (label) {
+                    "PEN" -> onBrushChange(brush.copy(eraser = false))
+                    "ERASE" -> onBrushChange(brush.copy(eraser = true))
+                }
+            }
         }
 
         Box(
@@ -531,23 +635,40 @@ private fun ToolFan(modifier: Modifier = Modifier) {
                 .border(1.dp, Color.White.copy(alpha = 0.30f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            Text("…", color = Color.White, fontSize = 22.sp)
+            Text(if (brush.eraser) "E" else "P", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
 
 @Composable
-private fun FanOrb(label: String, modifier: Modifier = Modifier) {
+private fun FanOrb(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit = {},
+) {
     Row(
-        modifier = modifier,
+        modifier = if (enabled) modifier.clickable(onClick = onClick) else modifier,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
             modifier = Modifier
                 .size(38.dp)
-                .shadow(8.dp, CircleShape)
-                .background(InkframeRose.copy(alpha = 0.72f), CircleShape)
-                .border(1.dp, Color.White.copy(alpha = 0.18f), CircleShape),
+                .shadow(if (selected) 14.dp else 8.dp, CircleShape)
+                .background(
+                    when {
+                        selected -> InkframePinkHot.copy(alpha = 0.92f)
+                        enabled -> InkframeRose.copy(alpha = 0.82f)
+                        else -> InkframeRose.copy(alpha = 0.52f)
+                    },
+                    CircleShape,
+                )
+                .border(
+                    1.dp,
+                    if (selected) Color.White.copy(alpha = 0.62f) else Color.White.copy(alpha = 0.18f),
+                    CircleShape,
+                ),
             contentAlignment = Alignment.Center,
         ) {
             Text(label.take(1), color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
@@ -555,10 +676,104 @@ private fun FanOrb(label: String, modifier: Modifier = Modifier) {
         Spacer(Modifier.width(4.dp))
         Text(
             label,
-            color = Color.White.copy(alpha = 0.78f),
+            color = Color.White.copy(alpha = if (enabled) 0.92f else 0.58f),
             fontSize = 7.sp,
             fontWeight = FontWeight.Bold,
         )
+    }
+}
+
+@Composable
+private fun BrushControlCluster(
+    brush: BrushUiState,
+    onBrushChange: (BrushUiState) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        ValueOrb(
+            value = "${(brush.opacity * 100).toInt()}",
+            label = "OPACITY",
+            accent = displayColor(brush.colorRgb),
+        ) {
+            onBrushChange(brush.copy(opacity = nextValue(BrushOpacities, brush.opacity)))
+        }
+        ValueOrb(
+            value = brush.sizePx.toInt().toString(),
+            label = "SIZE",
+            accent = displayColor(brush.colorRgb),
+        ) {
+            onBrushChange(brush.copy(sizePx = nextValue(BrushSizes, brush.sizePx)))
+        }
+    }
+}
+
+@Composable
+private fun ValueOrb(
+    value: String,
+    label: String,
+    accent: Color,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.clickable(onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(54.dp)
+                .shadow(12.dp, CircleShape)
+                .background(InkframePaper.copy(alpha = 0.88f), CircleShape)
+                .border(3.dp, accent.copy(alpha = 0.86f), CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(value, color = InkframeNight, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        Text(label, color = InkframeText, fontSize = 7.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun ColorPalette(
+    brush: BrushUiState,
+    onBrushChange: (BrushUiState) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        BrushPalette.forEach { swatch ->
+            val selected = swatch.rgb == brush.colorRgb && !brush.eraser
+            Column(
+                modifier = Modifier.clickable {
+                    onBrushChange(brush.copy(colorRgb = swatch.rgb, eraser = false))
+                },
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(if (selected) 56.dp else 46.dp)
+                        .shadow(if (selected) 16.dp else 8.dp, CircleShape)
+                        .background(displayColor(swatch.rgb), CircleShape)
+                        .border(
+                            if (selected) 3.dp else 1.dp,
+                            Color.White.copy(alpha = if (selected) 0.92f else 0.42f),
+                            CircleShape,
+                        ),
+                )
+                Text(
+                    swatch.name,
+                    color = InkframeText,
+                    fontSize = 6.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
     }
 }
 
@@ -675,13 +890,28 @@ private fun GlassPill(label: String, selected: Boolean = false) {
 }
 
 @Composable
-private fun CompactDock(label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+private fun CompactDock(
+    label: String,
+    selected: Boolean = false,
+    swatch: Color? = null,
+    onClick: () -> Unit = {},
+) {
+    Column(
+        modifier = Modifier.clickable(onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
         Box(
             modifier = Modifier
                 .size(38.dp)
-                .background(InkframePink.copy(alpha = 0.62f), CircleShape)
-                .border(1.dp, Color.White.copy(alpha = 0.22f), CircleShape),
+                .background(
+                    swatch ?: if (selected) InkframePinkHot.copy(alpha = 0.86f) else InkframePink.copy(alpha = 0.62f),
+                    CircleShape,
+                )
+                .border(
+                    if (selected) 2.dp else 1.dp,
+                    Color.White.copy(alpha = if (selected) 0.72f else 0.22f),
+                    CircleShape,
+                ),
         )
         Text(label, color = InkframeMuted, fontSize = 7.sp, fontWeight = FontWeight.Bold)
     }

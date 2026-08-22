@@ -1,9 +1,9 @@
 use crate::renderer::AndroidRenderer;
 use inkframe_core::decode_stroke_samples;
-use inkframe_engine::{EngineHost, NativeSurface};
+use inkframe_engine::{BrushSettings, EngineHost, NativeSurface};
 use jni::EnvUnowned;
 use jni::objects::{JByteBuffer, JClass, JObject};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jfloat, jint, jlong};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -131,6 +131,41 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_resizeSurfac
                     JNI_FALSE
                 },
             )
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_setBrush<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    id: jlong,
+    color_rgb: jint,
+    size_px: jfloat,
+    opacity: jfloat,
+    eraser: jboolean,
+) -> jboolean {
+    unowned_env
+        .with_env(|_env| -> Result<jboolean, jni::errors::Error> {
+            let Some(host) = engine(id) else {
+                return Ok(JNI_FALSE);
+            };
+            let rgb = color_rgb as u32;
+            let settings = BrushSettings {
+                color_srgb: [
+                    ((rgb >> 16) & 0xff) as u8,
+                    ((rgb >> 8) & 0xff) as u8,
+                    (rgb & 0xff) as u8,
+                ],
+                size_px,
+                opacity,
+                eraser: eraser != JNI_FALSE,
+            };
+            Ok(if host.set_brush(settings).is_ok() {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            })
         })
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }

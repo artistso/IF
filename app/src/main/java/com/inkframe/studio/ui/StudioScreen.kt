@@ -32,17 +32,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -52,7 +48,6 @@ import kotlin.math.sin
 private val InkframePink = Color(0xFFD60057)
 private val InkframePinkHot = Color(0xFFFF4C91)
 private val InkframeRose = Color(0xFF8B123F)
-private val InkframePlum = Color(0xFF240016)
 private val InkframeNight = Color(0xFF0E0710)
 private val InkframePaper = Color(0xFFFFF2F5)
 private val InkframeGlass = Color(0x66FFF5F8)
@@ -401,6 +396,7 @@ private fun OrbitMarkers() {
         }
 
         listOf(
+            Triple((-198).dp, (-6).dp, "4"),
             Triple((-116).dp, (-2).dp, "3"),
             Triple((-34).dp, 10.dp, "2"),
             Triple(68.dp, 14.dp, "1"),

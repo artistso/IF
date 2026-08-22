@@ -41,7 +41,8 @@ impl BrushPipeline {
             }
         };
 
-        let vertex_words = spirv_words(include_bytes!(concat!(env!("OUT_DIR"), "/brush.vert.spv")))?;
+        let vertex_words =
+            spirv_words(include_bytes!(concat!(env!("OUT_DIR"), "/brush.vert.spv")))?;
         let fragment_words =
             spirv_words(include_bytes!(concat!(env!("OUT_DIR"), "/brush.frag.spv")))?;
         let vertex_info = vk::ShaderModuleCreateInfo::default().code(&vertex_words);
@@ -54,7 +55,9 @@ impl BrushPipeline {
                     device.destroy_buffer(instance_buffer, None);
                     device.free_memory(instance_memory, None);
                 }
-                return Err(format!("vkCreateShaderModule(brush vertex) failed: {error:?}"));
+                return Err(format!(
+                    "vkCreateShaderModule(brush vertex) failed: {error:?}"
+                ));
             }
         };
         let fragment_module = match unsafe { device.create_shader_module(&fragment_info, None) } {
@@ -172,9 +175,9 @@ impl BrushPipeline {
                 Ok(mut pipelines) => pipelines
                     .pop()
                     .ok_or_else(|| "Vulkan returned no brush graphics pipeline".to_string()),
-                Err((_pipelines, error)) => {
-                    Err(format!("vkCreateGraphicsPipelines(brush) failed: {error:?}"))
-                }
+                Err((_pipelines, error)) => Err(format!(
+                    "vkCreateGraphicsPipelines(brush) failed: {error:?}"
+                )),
             }
         })();
 
@@ -247,7 +250,11 @@ impl BrushPipeline {
             return;
         }
         unsafe {
-            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.instance_buffer], &[0]);
             device.cmd_draw(command_buffer, 6, instance_count, 0, 0);
         }

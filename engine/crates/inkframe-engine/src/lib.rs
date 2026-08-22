@@ -1,12 +1,16 @@
-use inkframe_core::StrokeSample;
+use inkframe_core::{StrokeSample, sample_flags};
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
+/// Engine-internal marker used only after JNI decoding. It is never part of the
+/// public 32-byte stylus packet ABI. Renderers that understand brush controls
+/// consume this tagged sample before normal stroke processing.
+pub const BRUSH_SETTINGS_SAMPLE_FLAG: u32 = 1 << 30;
 
-type LifecycleReply = SyncSender<Result<(), String>>;
+type ControlReply = SyncSender<Result<(), String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSurface {
@@ -18,19 +22,59 @@ pub struct NativeSurface {
     pub height: u32,
 }
 
+/// User-facing brush state sent across the engine thread boundary. Color is kept
+/// in display-space sRGB here; the stroke renderer converts it to linear space at
+/// the raster/presentation boundary so Android UI palettes use normal RGB values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushSettings {
+    pub color_srgb: [u8; 3],
+    pub size_px: f32,
+    pub opacity: f32,
+    pub eraser: bool,
+}
+
+impl Default for BrushSettings {
+    fn default() -> Self {
+        Self {
+            color_srgb: [200, 0, 70],
+            size_px: 14.0,
+            opacity: 1.0,
+            eraser: false,
+        }
+    }
+}
+
+impl BrushSettings {
+    pub fn sanitized(mut self) -> Self {
+        if !self.size_px.is_finite() {
+            self.size_px = Self::default().size_px;
+        }
+        if !self.opacity.is_finite() {
+            self.opacity = Self::default().opacity;
+        }
+        self.size_px = self.size_px.clamp(0.5, 256.0);
+        self.opacity = self.opacity.clamp(0.0, 1.0);
+        self
+    }
+}
+
 #[derive(Debug)]
 pub enum EngineCommand {
     AttachSurface {
         surface: NativeSurface,
-        reply: LifecycleReply,
+        reply: ControlReply,
     },
     DetachSurface {
-        reply: LifecycleReply,
+        reply: ControlReply,
     },
     Resize {
         width: u32,
         height: u32,
-        reply: LifecycleReply,
+        reply: ControlReply,
+    },
+    SetBrush {
+        settings: BrushSettings,
+        reply: ControlReply,
     },
     Input(Vec<StrokeSample>),
     Shutdown,
@@ -84,7 +128,7 @@ impl fmt::Display for SubmitError {
             Self::Backpressure => write!(f, "engine command queue is full"),
             Self::Stopped => write!(f, "engine thread has stopped"),
             Self::InvalidSurfaceSize => write!(f, "surface dimensions must be non-zero"),
-            Self::Renderer(message) => write!(f, "renderer rejected lifecycle command: {message}"),
+            Self::Renderer(message) => write!(f, "renderer rejected command: {message}"),
         }
     }
 }
@@ -117,22 +161,22 @@ impl EngineHost {
         }
     }
 
-    /// Lifecycle operations are acknowledged by the renderer. Unlike high-rate stylus
-    /// input, attach/detach/resize are never discarded because the bounded command queue
-    /// is temporarily full: Android surface ownership must remain exact under input load.
+    /// Low-rate control operations are acknowledged by the engine thread. Unlike
+    /// high-rate stylus input, these commands are never discarded because the
+    /// bounded queue is temporarily full.
     pub fn attach_surface(&self, surface: NativeSurface) -> Result<(), SubmitError> {
         if surface.width == 0 || surface.height == 0 {
             return Err(SubmitError::InvalidSurfaceSize);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send_lifecycle(EngineCommand::AttachSurface { surface, reply })?;
-        Self::await_lifecycle(receiver)
+        self.send_control(EngineCommand::AttachSurface { surface, reply })?;
+        Self::await_control(receiver)
     }
 
     pub fn detach_surface(&self) -> Result<(), SubmitError> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send_lifecycle(EngineCommand::DetachSurface { reply })?;
-        Self::await_lifecycle(receiver)
+        self.send_control(EngineCommand::DetachSurface { reply })?;
+        Self::await_control(receiver)
     }
 
     pub fn resize(&self, width: u32, height: u32) -> Result<(), SubmitError> {
@@ -140,12 +184,21 @@ impl EngineHost {
             return Err(SubmitError::InvalidSurfaceSize);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send_lifecycle(EngineCommand::Resize {
+        self.send_control(EngineCommand::Resize {
             width,
             height,
             reply,
         })?;
-        Self::await_lifecycle(receiver)
+        Self::await_control(receiver)
+    }
+
+    pub fn set_brush(&self, settings: BrushSettings) -> Result<(), SubmitError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send_control(EngineCommand::SetBrush {
+            settings: settings.sanitized(),
+            reply,
+        })?;
+        Self::await_control(receiver)
     }
 
     pub fn submit_input(&self, samples: Vec<StrokeSample>) -> Result<(), SubmitError> {
@@ -166,11 +219,11 @@ impl EngineHost {
         *self.stats.lock().unwrap()
     }
 
-    fn send_lifecycle(&self, command: EngineCommand) -> Result<(), SubmitError> {
+    fn send_control(&self, command: EngineCommand) -> Result<(), SubmitError> {
         self.sender.send(command).map_err(|_| SubmitError::Stopped)
     }
 
-    fn await_lifecycle(receiver: Receiver<Result<(), String>>) -> Result<(), SubmitError> {
+    fn await_control(receiver: Receiver<Result<(), String>>) -> Result<(), SubmitError> {
         match receiver.recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => Err(SubmitError::Renderer(message)),
@@ -194,11 +247,35 @@ fn note_renderer_error(stats: &Arc<Mutex<EngineStats>>, result: &Result<(), Stri
     }
 }
 
+fn brush_settings_sample(settings: BrushSettings) -> StrokeSample {
+    let settings = settings.sanitized();
+    StrokeSample {
+        x: settings.size_px,
+        y: settings.opacity,
+        pressure: settings.color_srgb[0] as f32 / 255.0,
+        tilt: settings.color_srgb[1] as f32 / 255.0,
+        orientation: settings.color_srgb[2] as f32 / 255.0,
+        time_ns: 0,
+        flags: BRUSH_SETTINGS_SAMPLE_FLAG
+            | if settings.eraser {
+                sample_flags::ERASER
+            } else {
+                0
+            },
+    }
+}
+
 fn run_engine<R: RendererBackend>(
     receiver: Receiver<EngineCommand>,
     mut renderer: R,
     stats: Arc<Mutex<EngineStats>>,
 ) {
+    // Brush controls are acknowledged/stored immediately without touching the
+    // swapchain. The latest state is injected immediately before the next real
+    // stylus packet, preserving engine-thread ordering while avoiding UI/native
+    // desynchronization when presentation is temporarily unavailable.
+    let mut pending_brush: Option<BrushSettings> = None;
+
     while let Ok(command) = receiver.recv() {
         match command {
             EngineCommand::AttachSurface { surface, reply } => {
@@ -219,11 +296,19 @@ fn run_engine<R: RendererBackend>(
                 note_renderer_error(&stats, &result);
                 let _ = reply.send(result);
             }
-            EngineCommand::Input(samples) => {
+            EngineCommand::SetBrush { settings, reply } => {
+                pending_brush = Some(settings.sanitized());
+                let _ = reply.send(Ok(()));
+            }
+            EngineCommand::Input(mut samples) => {
+                let physical_sample_count = samples.len();
+                if let Some(settings) = pending_brush.take() {
+                    samples.insert(0, brush_settings_sample(settings));
+                }
                 {
                     let mut stats = stats.lock().unwrap();
                     stats.input_packets += 1;
-                    stats.input_samples += samples.len() as u64;
+                    stats.input_samples += physical_sample_count as u64;
                 }
                 let result = renderer.ingest_input(&samples);
                 note_renderer_error(&stats, &result);
@@ -239,7 +324,6 @@ fn run_engine<R: RendererBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkframe_core::sample_flags;
 
     #[derive(Default)]
     struct RejectingRenderer;
@@ -256,6 +340,27 @@ mod tests {
         }
 
         fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct CaptureRenderer {
+        packets: Arc<Mutex<Vec<Vec<StrokeSample>>>>,
+    }
+
+    impl RendererBackend for CaptureRenderer {
+        fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn detach_surface(&mut self) {}
+
+        fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn ingest_input(&mut self, samples: &[StrokeSample]) -> Result<(), String> {
+            self.packets.lock().unwrap().push(samples.to_vec());
             Ok(())
         }
     }
@@ -286,6 +391,95 @@ mod tests {
             Err(SubmitError::Renderer("test surface rejection".into()))
         );
         assert_eq!(engine.stats().renderer_errors, 1);
+    }
+
+    #[test]
+    fn brush_control_is_acknowledged_without_presenting() {
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let engine = EngineHost::spawn(CaptureRenderer {
+            packets: Arc::clone(&packets),
+        });
+        assert!(
+            engine
+                .set_brush(BrushSettings {
+                    color_srgb: [20, 40, 220],
+                    size_px: 24.0,
+                    opacity: 0.5,
+                    eraser: false,
+                })
+                .is_ok()
+        );
+        assert!(packets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_brush_control_is_injected_before_next_stylus_packet() {
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let engine = EngineHost::spawn(CaptureRenderer {
+            packets: Arc::clone(&packets),
+        });
+        engine
+            .set_brush(BrushSettings {
+                color_srgb: [10, 120, 250],
+                size_px: 32.0,
+                opacity: 0.25,
+                eraser: true,
+            })
+            .unwrap();
+        engine
+            .submit_input(vec![StrokeSample {
+                x: 1.0,
+                y: 2.0,
+                pressure: 1.0,
+                tilt: 0.0,
+                orientation: 0.0,
+                time_ns: 1,
+                flags: sample_flags::DOWN,
+            }])
+            .unwrap();
+
+        // Wait for the asynchronous input packet to cross the engine thread.
+        for _ in 0..100 {
+            if !packets.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let captured = packets.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 2);
+        assert_ne!(captured[0][0].flags & BRUSH_SETTINGS_SAMPLE_FLAG, 0);
+        assert_ne!(captured[0][0].flags & sample_flags::ERASER, 0);
+        assert_eq!(captured[0][1].flags, sample_flags::DOWN);
+    }
+
+    #[test]
+    fn brush_values_are_sanitized() {
+        let settings = BrushSettings {
+            size_px: f32::INFINITY,
+            opacity: -4.0,
+            ..BrushSettings::default()
+        }
+        .sanitized();
+        assert_eq!(settings.size_px, BrushSettings::default().size_px);
+        assert_eq!(settings.opacity, 0.0);
+    }
+
+    #[test]
+    fn internal_brush_sample_round_trips_settings_fields() {
+        let sample = brush_settings_sample(BrushSettings {
+            color_srgb: [10, 120, 250],
+            size_px: 32.0,
+            opacity: 0.25,
+            eraser: true,
+        });
+        assert_ne!(sample.flags & BRUSH_SETTINGS_SAMPLE_FLAG, 0);
+        assert_ne!(sample.flags & sample_flags::ERASER, 0);
+        assert_eq!(sample.x, 32.0);
+        assert_eq!(sample.y, 0.25);
+        assert!((sample.pressure * 255.0 - 10.0).abs() < 0.01);
+        assert!((sample.tilt * 255.0 - 120.0).abs() < 0.01);
+        assert!((sample.orientation * 255.0 - 250.0).abs() < 0.01);
     }
 
     #[test]

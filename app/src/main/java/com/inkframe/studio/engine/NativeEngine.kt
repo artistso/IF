@@ -27,6 +27,11 @@ class NativeEngine : Closeable {
         return id != 0L && NativeBridge.resizeSurface(id, width, height)
     }
 
+    fun setBrush(colorRgb: Int, sizePx: Float, opacity: Float, eraser: Boolean): Boolean {
+        val id = engineId
+        return id != 0L && NativeBridge.setBrush(id, colorRgb, sizePx, opacity, eraser)
+    }
+
     fun pushInput(buffer: ByteBuffer, sampleCount: Int): Boolean {
         val id = engineId
         return id != 0L && NativeBridge.pushInput(id, buffer, sampleCount)

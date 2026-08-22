@@ -10,8 +10,6 @@ use inkframe_engine::{NativeSurface, RendererBackend};
 // transfer conversion at the presentation boundary.
 const BACKGROUND_COLOR: [f32; 4] = [1.0, 0.888, 0.913, 1.0];
 const BACKGROUND_RGB8: [u8; 3] = [255, 226, 233];
-const INK_COLOR: [f32; 4] = [0.578, 0.0, 0.061, 1.0];
-const PREDICTED_COLOR: [f32; 4] = [1.0, 0.072, 0.283, 1.0];
 const PREDICTED_ERASER_COLOR: [f32; 4] = [0.78, 0.66, 0.70, 1.0];
 
 struct SwapchainState {
@@ -710,16 +708,14 @@ impl AndroidRenderer {
         let Some(rect) = Self::dab_rect(dab, extent) else {
             return;
         };
-        let color = if predicted {
-            if dab.eraser {
+        let color = if dab.eraser {
+            if predicted {
                 PREDICTED_ERASER_COLOR
             } else {
-                PREDICTED_COLOR
+                BACKGROUND_COLOR
             }
-        } else if dab.eraser {
-            BACKGROUND_COLOR
         } else {
-            INK_COLOR
+            dab.display_color
         };
         let attachment = vk::ClearAttachment::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)

@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 
-type LifecycleReply = SyncSender<Result<(), String>>;
+type ControlReply = SyncSender<Result<(), String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSurface {
@@ -18,19 +18,59 @@ pub struct NativeSurface {
     pub height: u32,
 }
 
+/// User-facing brush state sent across the engine thread boundary. Color is kept
+/// in display-space sRGB here; the renderer converts it to linear space at the
+/// raster/presentation boundary so Android UI palettes can use normal RGB values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushSettings {
+    pub color_srgb: [u8; 3],
+    pub size_px: f32,
+    pub opacity: f32,
+    pub eraser: bool,
+}
+
+impl Default for BrushSettings {
+    fn default() -> Self {
+        Self {
+            color_srgb: [200, 0, 70],
+            size_px: 14.0,
+            opacity: 1.0,
+            eraser: false,
+        }
+    }
+}
+
+impl BrushSettings {
+    pub fn sanitized(mut self) -> Self {
+        if !self.size_px.is_finite() {
+            self.size_px = Self::default().size_px;
+        }
+        if !self.opacity.is_finite() {
+            self.opacity = Self::default().opacity;
+        }
+        self.size_px = self.size_px.clamp(0.5, 256.0);
+        self.opacity = self.opacity.clamp(0.0, 1.0);
+        self
+    }
+}
+
 #[derive(Debug)]
 pub enum EngineCommand {
     AttachSurface {
         surface: NativeSurface,
-        reply: LifecycleReply,
+        reply: ControlReply,
     },
     DetachSurface {
-        reply: LifecycleReply,
+        reply: ControlReply,
     },
     Resize {
         width: u32,
         height: u32,
-        reply: LifecycleReply,
+        reply: ControlReply,
+    },
+    SetBrush {
+        settings: BrushSettings,
+        reply: ControlReply,
     },
     Input(Vec<StrokeSample>),
     Shutdown,
@@ -48,6 +88,7 @@ pub trait RendererBackend: Send + 'static {
     fn attach_surface(&mut self, surface: NativeSurface) -> Result<(), String>;
     fn detach_surface(&mut self);
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String>;
+    fn set_brush(&mut self, settings: BrushSettings) -> Result<(), String>;
     fn ingest_input(&mut self, samples: &[StrokeSample]) -> Result<(), String>;
 }
 
@@ -62,6 +103,10 @@ impl RendererBackend for NullRenderer {
     fn detach_surface(&mut self) {}
 
     fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_brush(&mut self, _settings: BrushSettings) -> Result<(), String> {
         Ok(())
     }
 
@@ -84,7 +129,7 @@ impl fmt::Display for SubmitError {
             Self::Backpressure => write!(f, "engine command queue is full"),
             Self::Stopped => write!(f, "engine thread has stopped"),
             Self::InvalidSurfaceSize => write!(f, "surface dimensions must be non-zero"),
-            Self::Renderer(message) => write!(f, "renderer rejected lifecycle command: {message}"),
+            Self::Renderer(message) => write!(f, "renderer rejected command: {message}"),
         }
     }
 }
@@ -117,22 +162,22 @@ impl EngineHost {
         }
     }
 
-    /// Lifecycle operations are acknowledged by the renderer. Unlike high-rate stylus
-    /// input, attach/detach/resize are never discarded because the bounded command queue
-    /// is temporarily full: Android surface ownership must remain exact under input load.
+    /// Low-rate control operations are acknowledged by the renderer. Unlike
+    /// high-rate stylus input, these commands are never discarded because the
+    /// bounded queue is temporarily full.
     pub fn attach_surface(&self, surface: NativeSurface) -> Result<(), SubmitError> {
         if surface.width == 0 || surface.height == 0 {
             return Err(SubmitError::InvalidSurfaceSize);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send_lifecycle(EngineCommand::AttachSurface { surface, reply })?;
-        Self::await_lifecycle(receiver)
+        self.send_control(EngineCommand::AttachSurface { surface, reply })?;
+        Self::await_control(receiver)
     }
 
     pub fn detach_surface(&self) -> Result<(), SubmitError> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send_lifecycle(EngineCommand::DetachSurface { reply })?;
-        Self::await_lifecycle(receiver)
+        self.send_control(EngineCommand::DetachSurface { reply })?;
+        Self::await_control(receiver)
     }
 
     pub fn resize(&self, width: u32, height: u32) -> Result<(), SubmitError> {
@@ -140,12 +185,21 @@ impl EngineHost {
             return Err(SubmitError::InvalidSurfaceSize);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send_lifecycle(EngineCommand::Resize {
+        self.send_control(EngineCommand::Resize {
             width,
             height,
             reply,
         })?;
-        Self::await_lifecycle(receiver)
+        Self::await_control(receiver)
+    }
+
+    pub fn set_brush(&self, settings: BrushSettings) -> Result<(), SubmitError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send_control(EngineCommand::SetBrush {
+            settings: settings.sanitized(),
+            reply,
+        })?;
+        Self::await_control(receiver)
     }
 
     pub fn submit_input(&self, samples: Vec<StrokeSample>) -> Result<(), SubmitError> {
@@ -166,11 +220,11 @@ impl EngineHost {
         *self.stats.lock().unwrap()
     }
 
-    fn send_lifecycle(&self, command: EngineCommand) -> Result<(), SubmitError> {
+    fn send_control(&self, command: EngineCommand) -> Result<(), SubmitError> {
         self.sender.send(command).map_err(|_| SubmitError::Stopped)
     }
 
-    fn await_lifecycle(receiver: Receiver<Result<(), String>>) -> Result<(), SubmitError> {
+    fn await_control(receiver: Receiver<Result<(), String>>) -> Result<(), SubmitError> {
         match receiver.recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => Err(SubmitError::Renderer(message)),
@@ -219,6 +273,11 @@ fn run_engine<R: RendererBackend>(
                 note_renderer_error(&stats, &result);
                 let _ = reply.send(result);
             }
+            EngineCommand::SetBrush { settings, reply } => {
+                let result = renderer.set_brush(settings);
+                note_renderer_error(&stats, &result);
+                let _ = reply.send(result);
+            }
             EngineCommand::Input(samples) => {
                 {
                     let mut stats = stats.lock().unwrap();
@@ -255,6 +314,10 @@ mod tests {
             Err("test resize rejection".into())
         }
 
+        fn set_brush(&mut self, _settings: BrushSettings) -> Result<(), String> {
+            Err("test brush rejection".into())
+        }
+
         fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> {
             Ok(())
         }
@@ -286,6 +349,33 @@ mod tests {
             Err(SubmitError::Renderer("test surface rejection".into()))
         );
         assert_eq!(engine.stats().renderer_errors, 1);
+    }
+
+    #[test]
+    fn brush_control_is_acknowledged() {
+        let engine = EngineHost::spawn(NullRenderer);
+        assert!(
+            engine
+                .set_brush(BrushSettings {
+                    color_srgb: [20, 40, 220],
+                    size_px: 24.0,
+                    opacity: 0.5,
+                    eraser: false,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn brush_values_are_sanitized() {
+        let settings = BrushSettings {
+            size_px: f32::INFINITY,
+            opacity: -4.0,
+            ..BrushSettings::default()
+        }
+        .sanitized();
+        assert_eq!(settings.size_px, BrushSettings::default().size_px);
+        assert_eq!(settings.opacity, 0.0);
     }
 
     #[test]

@@ -47,45 +47,24 @@ mod tests {
 
     #[test]
     fn maps_android_pixels_to_vulkan_clip_space() {
-        let top_left = BrushInstance::from_pixels(
-            0.0,
-            0.0,
-            20.0,
-            [1.0, 0.0, 0.0, 1.0],
-            100,
-            200,
-            1.0,
-        )
-        .unwrap();
+        let top_left =
+            BrushInstance::from_pixels(0.0, 0.0, 20.0, [1.0, 0.0, 0.0, 1.0], 100, 200, 1.0)
+                .unwrap();
         assert_eq!(top_left.center, [-1.0, -1.0]);
         assert_eq!(top_left.half_size, [0.2, 0.1]);
 
-        let center = BrushInstance::from_pixels(
-            50.0,
-            100.0,
-            20.0,
-            [1.0, 0.0, 0.0, 1.0],
-            100,
-            200,
-            1.0,
-        )
-        .unwrap();
+        let center =
+            BrushInstance::from_pixels(50.0, 100.0, 20.0, [1.0, 0.0, 0.0, 1.0], 100, 200, 1.0)
+                .unwrap();
         assert!(center.center[0].abs() < f32::EPSILON);
         assert!(center.center[1].abs() < f32::EPSILON);
     }
 
     #[test]
     fn scales_prediction_alpha_without_changing_rgb() {
-        let instance = BrushInstance::from_pixels(
-            10.0,
-            10.0,
-            8.0,
-            [0.2, 0.4, 0.8, 0.75],
-            100,
-            100,
-            0.5,
-        )
-        .unwrap();
+        let instance =
+            BrushInstance::from_pixels(10.0, 10.0, 8.0, [0.2, 0.4, 0.8, 0.75], 100, 100, 0.5)
+                .unwrap();
         assert_eq!(&instance.color[..3], &[0.2, 0.4, 0.8]);
         assert!((instance.color[3] - 0.375).abs() < f32::EPSILON);
     }
@@ -93,16 +72,8 @@ mod tests {
     #[test]
     fn rejects_zero_sized_viewports() {
         assert!(
-            BrushInstance::from_pixels(
-                1.0,
-                1.0,
-                4.0,
-                [1.0, 1.0, 1.0, 1.0],
-                0,
-                100,
-                1.0,
-            )
-            .is_none()
+            BrushInstance::from_pixels(1.0, 1.0, 4.0, [1.0, 1.0, 1.0, 1.0], 0, 100, 1.0,)
+                .is_none()
         );
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use inkframe_core::{Brush, StrokeSample, sample_flags};
-use inkframe_engine::BrushSettings;
+use inkframe_engine::{BRUSH_SETTINGS_SAMPLE_FLAG, BrushSettings};
 use inkframe_raster::{RasterDab, SparseRaster, StrokeScratch, StrokeStyle, TileCoord};
 
 const MAX_DABS_PER_SEGMENT: usize = 4096;
@@ -123,6 +123,22 @@ impl StrokePreview {
         let mut predicted_anchor = self.last_actual;
 
         for sample in samples.iter().copied() {
+            if sample.flags & BRUSH_SETTINGS_SAMPLE_FLAG != 0 {
+                let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                self.set_brush_settings(BrushSettings {
+                    color_srgb: [
+                        channel(sample.pressure),
+                        channel(sample.tilt),
+                        channel(sample.orientation),
+                    ],
+                    size_px: sample.x,
+                    opacity: sample.y,
+                    eraser: sample.flags & sample_flags::ERASER != 0,
+                });
+                predicted_anchor = self.last_actual;
+                continue;
+            }
+
             if sample.flags & sample_flags::CANCEL != 0 {
                 self.cancel_active_stroke();
                 predicted_anchor = None;
@@ -392,6 +408,27 @@ mod tests {
         let committed = preview.committed();
         assert_eq!(committed.first().unwrap().diameter, 2.52);
         assert_eq!(committed.last().unwrap().diameter, 14.0);
+    }
+
+    #[test]
+    fn tagged_control_sample_updates_brush_without_drawing() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[StrokeSample {
+            x: 30.0,
+            y: 0.7,
+            pressure: 0.0,
+            tilt: 120.0 / 255.0,
+            orientation: 1.0,
+            time_ns: 0,
+            flags: BRUSH_SETTINGS_SAMPLE_FLAG | sample_flags::ERASER,
+        }]);
+        let settings = preview.brush_settings();
+        assert_eq!(settings.color_srgb, [0, 120, 255]);
+        assert_eq!(settings.size_px, 30.0);
+        assert!((settings.opacity - 0.7).abs() < f32::EPSILON);
+        assert!(settings.eraser);
+        assert!(preview.committed().is_empty());
+        assert_eq!(preview.raster().tile_count(), 0);
     }
 
     #[test]

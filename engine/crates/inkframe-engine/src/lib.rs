@@ -1,10 +1,14 @@
-use inkframe_core::StrokeSample;
+use inkframe_core::{StrokeSample, sample_flags};
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
+/// Engine-internal marker used only after JNI decoding. It is never part of the
+/// public 32-byte stylus packet ABI. Renderers that understand brush controls
+/// consume this tagged sample before normal stroke processing.
+pub const BRUSH_SETTINGS_SAMPLE_FLAG: u32 = 1 << 30;
 
 type ControlReply = SyncSender<Result<(), String>>;
 
@@ -19,8 +23,8 @@ pub struct NativeSurface {
 }
 
 /// User-facing brush state sent across the engine thread boundary. Color is kept
-/// in display-space sRGB here; the renderer converts it to linear space at the
-/// raster/presentation boundary so Android UI palettes can use normal RGB values.
+/// in display-space sRGB here; the stroke renderer converts it to linear space at
+/// the raster/presentation boundary so Android UI palettes use normal RGB values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrushSettings {
     pub color_srgb: [u8; 3],
@@ -88,7 +92,6 @@ pub trait RendererBackend: Send + 'static {
     fn attach_surface(&mut self, surface: NativeSurface) -> Result<(), String>;
     fn detach_surface(&mut self);
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String>;
-    fn set_brush(&mut self, settings: BrushSettings) -> Result<(), String>;
     fn ingest_input(&mut self, samples: &[StrokeSample]) -> Result<(), String>;
 }
 
@@ -103,10 +106,6 @@ impl RendererBackend for NullRenderer {
     fn detach_surface(&mut self) {}
 
     fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn set_brush(&mut self, _settings: BrushSettings) -> Result<(), String> {
         Ok(())
     }
 
@@ -248,6 +247,24 @@ fn note_renderer_error(stats: &Arc<Mutex<EngineStats>>, result: &Result<(), Stri
     }
 }
 
+fn brush_settings_sample(settings: BrushSettings) -> StrokeSample {
+    let settings = settings.sanitized();
+    StrokeSample {
+        x: settings.size_px,
+        y: settings.opacity,
+        pressure: settings.color_srgb[0] as f32 / 255.0,
+        tilt: settings.color_srgb[1] as f32 / 255.0,
+        orientation: settings.color_srgb[2] as f32 / 255.0,
+        time_ns: 0,
+        flags: BRUSH_SETTINGS_SAMPLE_FLAG
+            | if settings.eraser {
+                sample_flags::ERASER
+            } else {
+                0
+            },
+    }
+}
+
 fn run_engine<R: RendererBackend>(
     receiver: Receiver<EngineCommand>,
     mut renderer: R,
@@ -274,7 +291,11 @@ fn run_engine<R: RendererBackend>(
                 let _ = reply.send(result);
             }
             EngineCommand::SetBrush { settings, reply } => {
-                let result = renderer.set_brush(settings);
+                // Reuse the existing renderer input boundary without changing the
+                // public stylus ABI. StrokePreview consumes this tagged internal
+                // sample before normal input processing.
+                let control = brush_settings_sample(settings);
+                let result = renderer.ingest_input(&[control]);
                 note_renderer_error(&stats, &result);
                 let _ = reply.send(result);
             }
@@ -298,7 +319,6 @@ fn run_engine<R: RendererBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkframe_core::sample_flags;
 
     #[derive(Default)]
     struct RejectingRenderer;
@@ -312,10 +332,6 @@ mod tests {
 
         fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
             Err("test resize rejection".into())
-        }
-
-        fn set_brush(&mut self, _settings: BrushSettings) -> Result<(), String> {
-            Err("test brush rejection".into())
         }
 
         fn ingest_input(&mut self, _samples: &[StrokeSample]) -> Result<(), String> {
@@ -376,6 +392,23 @@ mod tests {
         .sanitized();
         assert_eq!(settings.size_px, BrushSettings::default().size_px);
         assert_eq!(settings.opacity, 0.0);
+    }
+
+    #[test]
+    fn internal_brush_sample_round_trips_settings_fields() {
+        let sample = brush_settings_sample(BrushSettings {
+            color_srgb: [10, 120, 250],
+            size_px: 32.0,
+            opacity: 0.25,
+            eraser: true,
+        });
+        assert_ne!(sample.flags & BRUSH_SETTINGS_SAMPLE_FLAG, 0);
+        assert_ne!(sample.flags & sample_flags::ERASER, 0);
+        assert_eq!(sample.x, 32.0);
+        assert_eq!(sample.y, 0.25);
+        assert!((sample.pressure * 255.0 - 10.0).abs() < 0.01);
+        assert!((sample.tilt * 255.0 - 120.0).abs() < 0.01);
+        assert!((sample.orientation * 255.0 - 250.0).abs() < 0.01);
     }
 
     #[test]

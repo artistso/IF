@@ -10,7 +10,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 inkframe-core.workspace = true
-inkframe-engine.workspace = true
+# The Android cdylib must be named `inkframe_engine` for System.loadLibrary.
+# Alias the Rust engine dependency so rustdoc never receives two extern crates
+# with that same name when this crate is built as both rlib and cdylib.
+inkframe-engine-core = { package = "inkframe-engine", path = "../inkframe-engine" }
 inkframe-raster.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]

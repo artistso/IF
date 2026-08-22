@@ -11,6 +11,10 @@ const MAX_SPACING_PX: f32 = 4.0;
 /// state is no longer bounded by this value; only the legacy Vulkan replay is.
 pub(crate) const MAX_BOOTSTRAP_DABS: usize = 4096;
 const MAX_PREDICTED_DABS: usize = 512;
+/// Warm paper background in linear space. Preview dabs precompose their selected
+/// opacity over this color because the temporary clear-attachment renderer has no
+/// blend pipeline yet. The persistent raster uses the same background at upload.
+pub(crate) const PAPER_LINEAR_RGB: [f32; 3] = [1.0, 0.888, 0.913];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StrokeDab {
@@ -18,6 +22,10 @@ pub(crate) struct StrokeDab {
     pub y: f32,
     pub diameter: f32,
     pub eraser: bool,
+    /// Opaque linear display color already composited over InkFrame paper. Keeping
+    /// this per dab preserves the original brush color in the legacy replay even
+    /// after the user changes brush settings.
+    pub display_color: [f32; 4],
 }
 
 #[derive(Debug)]
@@ -147,9 +155,11 @@ impl StrokePreview {
 
             if sample.is_predicted() {
                 if self.active_stroke_start.is_some() {
+                    let display_color = self.preview_display_color();
                     Self::append_segment(
                         &self.brush,
                         self.settings.eraser,
+                        display_color,
                         &mut self.predicted,
                         predicted_anchor,
                         sample,
@@ -177,10 +187,12 @@ impl StrokePreview {
             }
 
             let previous = self.last_actual;
+            let display_color = self.preview_display_color();
             let mut generated = Vec::new();
             Self::append_segment(
                 &self.brush,
                 self.settings.eraser,
+                display_color,
                 &mut generated,
                 previous,
                 sample,
@@ -220,14 +232,17 @@ impl StrokePreview {
         }
     }
 
-    fn srgb_channel_to_linear_byte(value: u8) -> u8 {
+    fn srgb_channel_to_linear(value: u8) -> f32 {
         let srgb = value as f32 / 255.0;
-        let linear = if srgb <= 0.04045 {
+        if srgb <= 0.04045 {
             srgb / 12.92
         } else {
             ((srgb + 0.055) / 1.055).powf(2.4)
-        };
-        (linear * 255.0).round() as u8
+        }
+    }
+
+    fn srgb_channel_to_linear_byte(value: u8) -> u8 {
+        (Self::srgb_channel_to_linear(value) * 255.0).round() as u8
     }
 
     fn linear_ink_rgba(&self) -> [u8; 4] {
@@ -236,6 +251,22 @@ impl StrokePreview {
             Self::srgb_channel_to_linear_byte(self.settings.color_srgb[1]),
             Self::srgb_channel_to_linear_byte(self.settings.color_srgb[2]),
             (self.brush.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+
+    fn preview_display_color(&self) -> [f32; 4] {
+        let opacity = self.brush.opacity.clamp(0.0, 1.0);
+        let inverse = 1.0 - opacity;
+        let ink = [
+            Self::srgb_channel_to_linear(self.settings.color_srgb[0]),
+            Self::srgb_channel_to_linear(self.settings.color_srgb[1]),
+            Self::srgb_channel_to_linear(self.settings.color_srgb[2]),
+        ];
+        [
+            ink[0] * opacity + PAPER_LINEAR_RGB[0] * inverse,
+            ink[1] * opacity + PAPER_LINEAR_RGB[1] * inverse,
+            ink[2] * opacity + PAPER_LINEAR_RGB[2] * inverse,
+            1.0,
         ]
     }
 
@@ -338,12 +369,18 @@ impl StrokePreview {
     fn append_segment(
         brush: &Brush,
         force_eraser: bool,
+        display_color: [f32; 4],
         target: &mut Vec<StrokeDab>,
         previous: Option<StrokeSample>,
         sample: StrokeSample,
     ) {
         let Some(previous) = previous else {
-            target.push(Self::dab_from_sample(brush, force_eraser, sample));
+            target.push(Self::dab_from_sample(
+                brush,
+                force_eraser,
+                display_color,
+                sample,
+            ));
             return;
         };
 
@@ -367,16 +404,23 @@ impl StrokePreview {
                 y: previous.y + dy * t,
                 diameter: brush.diameter_for_pressure(pressure),
                 eraser,
+                display_color,
             });
         }
     }
 
-    fn dab_from_sample(brush: &Brush, force_eraser: bool, sample: StrokeSample) -> StrokeDab {
+    fn dab_from_sample(
+        brush: &Brush,
+        force_eraser: bool,
+        display_color: [f32; 4],
+        sample: StrokeSample,
+    ) -> StrokeDab {
         StrokeDab {
             x: sample.x,
             y: sample.y,
             diameter: brush.diameter_for_pressure(sample.pressure),
             eraser: force_eraser || sample.flags & sample_flags::ERASER != 0,
+            display_color,
         }
     }
 }
@@ -444,6 +488,50 @@ mod tests {
         let dab = preview.active().last().unwrap();
         assert_eq!(dab.diameter, 30.0);
         assert!(dab.eraser);
+    }
+
+    #[test]
+    fn live_preview_carries_selected_color_and_opacity() {
+        let mut preview = StrokePreview::default();
+        preview.set_brush_settings(BrushSettings {
+            color_srgb: [0, 0, 255],
+            size_px: 14.0,
+            opacity: 0.5,
+            eraser: false,
+        });
+        preview.ingest(&[sample(10.0, 1.0, sample_flags::DOWN, 1)]);
+        let color = preview.active().last().unwrap().display_color;
+        // 50% linear blue precomposited over the warm paper background.
+        assert!((color[0] - 0.5).abs() < 0.01);
+        assert!((color[1] - PAPER_LINEAR_RGB[1] * 0.5).abs() < 0.01);
+        assert!((color[2] - (0.5 + PAPER_LINEAR_RGB[2] * 0.5)).abs() < 0.01);
+        assert_eq!(color[3], 1.0);
+    }
+
+    #[test]
+    fn committed_preview_dabs_keep_their_original_color() {
+        let mut preview = StrokePreview::default();
+        preview.set_brush_settings(BrushSettings {
+            color_srgb: [0, 0, 255],
+            size_px: 14.0,
+            opacity: 1.0,
+            eraser: false,
+        });
+        preview.ingest(&[
+            sample(10.0, 1.0, sample_flags::DOWN, 1),
+            sample(10.0, 1.0, sample_flags::UP, 2),
+        ]);
+        let blue = preview.committed().first().unwrap().display_color;
+
+        preview.set_brush_settings(BrushSettings {
+            color_srgb: [255, 0, 0],
+            ..BrushSettings::default()
+        });
+        preview.ingest(&[sample(30.0, 1.0, sample_flags::DOWN, 3)]);
+
+        assert_eq!(preview.committed().first().unwrap().display_color, blue);
+        assert!(blue[2] > blue[0]);
+        assert!(preview.active().last().unwrap().display_color[0] > 0.9);
     }
 
     #[test]

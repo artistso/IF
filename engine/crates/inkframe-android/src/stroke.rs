@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use inkframe_core::{Brush, StrokeSample, sample_flags};
+use inkframe_engine::BrushSettings;
 use inkframe_raster::{RasterDab, SparseRaster, StrokeScratch, StrokeStyle, TileCoord};
 
 const MAX_DABS_PER_SEGMENT: usize = 4096;
@@ -10,8 +11,6 @@ const MAX_SPACING_PX: f32 = 4.0;
 /// state is no longer bounded by this value; only the legacy Vulkan replay is.
 pub(crate) const MAX_BOOTSTRAP_DABS: usize = 4096;
 const MAX_PREDICTED_DABS: usize = 512;
-// Linear-space equivalent of the default theme's deep rose display ink.
-const BOOTSTRAP_INK_RGBA: [u8; 4] = [147, 0, 16, 255];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StrokeDab {
@@ -36,6 +35,8 @@ enum ActiveRasterStroke {
 #[derive(Debug)]
 pub(crate) struct StrokePreview {
     brush: Brush,
+    settings: BrushSettings,
+    pending_settings: Option<BrushSettings>,
     committed: Vec<StrokeDab>,
     predicted: Vec<StrokeDab>,
     last_actual: Option<StrokeSample>,
@@ -54,8 +55,12 @@ impl Default for StrokePreview {
 impl StrokePreview {
     pub(crate) fn new(mut brush: Brush) -> Self {
         brush.sanitize();
+        let settings = BrushSettings::default().sanitized();
+        Self::apply_settings_to_brush(&mut brush, settings);
         Self {
             brush,
+            settings,
+            pending_settings: None,
             committed: Vec::new(),
             predicted: Vec::new(),
             last_actual: None,
@@ -64,6 +69,19 @@ impl StrokePreview {
             raster_tile_coords: BTreeSet::new(),
             active_raster_stroke: None,
         }
+    }
+
+    pub(crate) fn set_brush_settings(&mut self, settings: BrushSettings) {
+        let settings = settings.sanitized();
+        if self.active_stroke_start.is_some() {
+            self.pending_settings = Some(settings);
+            return;
+        }
+        self.apply_settings(settings);
+    }
+
+    pub(crate) fn brush_settings(&self) -> BrushSettings {
+        self.settings
     }
 
     pub(crate) fn committed(&self) -> &[StrokeDab] {
@@ -115,6 +133,7 @@ impl StrokePreview {
                 if self.active_stroke_start.is_some() {
                     Self::append_segment(
                         &self.brush,
+                        self.settings.eraser,
                         &mut self.predicted,
                         predicted_anchor,
                         sample,
@@ -143,7 +162,13 @@ impl StrokePreview {
 
             let previous = self.last_actual;
             let mut generated = Vec::new();
-            Self::append_segment(&self.brush, &mut generated, previous, sample);
+            Self::append_segment(
+                &self.brush,
+                self.settings.eraser,
+                &mut generated,
+                previous,
+                sample,
+            );
             self.accumulate_actual_raster(&generated);
             self.committed.extend_from_slice(&generated);
             self.enforce_committed_limit();
@@ -155,22 +180,55 @@ impl StrokePreview {
                 self.last_actual = None;
                 self.active_stroke_start = None;
                 predicted_anchor = None;
+                self.apply_pending_settings();
             }
         }
     }
 
+    fn apply_settings_to_brush(brush: &mut Brush, settings: BrushSettings) {
+        brush.size_px = settings.size_px;
+        brush.min_size_px = (settings.size_px * 0.18).clamp(0.5, settings.size_px);
+        brush.opacity = settings.opacity;
+        brush.sanitize();
+    }
+
+    fn apply_settings(&mut self, settings: BrushSettings) {
+        let settings = settings.sanitized();
+        Self::apply_settings_to_brush(&mut self.brush, settings);
+        self.settings = settings;
+    }
+
+    fn apply_pending_settings(&mut self) {
+        if let Some(settings) = self.pending_settings.take() {
+            self.apply_settings(settings);
+        }
+    }
+
+    fn srgb_channel_to_linear_byte(value: u8) -> u8 {
+        let srgb = value as f32 / 255.0;
+        let linear = if srgb <= 0.04045 {
+            srgb / 12.92
+        } else {
+            ((srgb + 0.055) / 1.055).powf(2.4)
+        };
+        (linear * 255.0).round() as u8
+    }
+
+    fn linear_ink_rgba(&self) -> [u8; 4] {
+        [
+            Self::srgb_channel_to_linear_byte(self.settings.color_srgb[0]),
+            Self::srgb_channel_to_linear_byte(self.settings.color_srgb[1]),
+            Self::srgb_channel_to_linear_byte(self.settings.color_srgb[2]),
+            (self.brush.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+
     fn begin_raster_stroke(&mut self, sample: StrokeSample) {
-        let eraser = sample.flags & sample_flags::ERASER != 0;
-        let alpha = (self.brush.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let eraser = self.settings.eraser || sample.flags & sample_flags::ERASER != 0;
         let style = if eraser {
             StrokeStyle::erase()
         } else {
-            StrokeStyle::ink([
-                BOOTSTRAP_INK_RGBA[0],
-                BOOTSTRAP_INK_RGBA[1],
-                BOOTSTRAP_INK_RGBA[2],
-                alpha,
-            ])
+            StrokeStyle::ink(self.linear_ink_rgba())
         }
         .with_build_up(self.brush.build_up);
 
@@ -240,6 +298,7 @@ impl StrokePreview {
         self.active_raster_stroke = None;
         self.last_actual = None;
         self.predicted.clear();
+        self.apply_pending_settings();
     }
 
     fn enforce_committed_limit(&mut self) {
@@ -262,12 +321,13 @@ impl StrokePreview {
 
     fn append_segment(
         brush: &Brush,
+        force_eraser: bool,
         target: &mut Vec<StrokeDab>,
         previous: Option<StrokeSample>,
         sample: StrokeSample,
     ) {
         let Some(previous) = previous else {
-            target.push(Self::dab_from_sample(brush, sample));
+            target.push(Self::dab_from_sample(brush, force_eraser, sample));
             return;
         };
 
@@ -281,7 +341,7 @@ impl StrokePreview {
         let steps = ((distance / spacing).ceil() as usize)
             .max(1)
             .min(MAX_DABS_PER_SEGMENT);
-        let eraser = sample.flags & sample_flags::ERASER != 0;
+        let eraser = force_eraser || sample.flags & sample_flags::ERASER != 0;
 
         for step in 1..=steps {
             let t = step as f32 / steps as f32;
@@ -295,12 +355,12 @@ impl StrokePreview {
         }
     }
 
-    fn dab_from_sample(brush: &Brush, sample: StrokeSample) -> StrokeDab {
+    fn dab_from_sample(brush: &Brush, force_eraser: bool, sample: StrokeSample) -> StrokeDab {
         StrokeDab {
             x: sample.x,
             y: sample.y,
             diameter: brush.diameter_for_pressure(sample.pressure),
-            eraser: sample.flags & sample_flags::ERASER != 0,
+            eraser: force_eraser || sample.flags & sample_flags::ERASER != 0,
         }
     }
 }
@@ -330,8 +390,57 @@ mod tests {
         ]);
 
         let committed = preview.committed();
-        assert_eq!(committed.first().unwrap().diameter, 2.0);
-        assert_eq!(committed.last().unwrap().diameter, 6.0);
+        assert_eq!(committed.first().unwrap().diameter, 2.52);
+        assert_eq!(committed.last().unwrap().diameter, 14.0);
+    }
+
+    #[test]
+    fn brush_settings_change_size_and_forced_eraser() {
+        let mut preview = StrokePreview::default();
+        preview.set_brush_settings(BrushSettings {
+            color_srgb: [0, 120, 255],
+            size_px: 30.0,
+            opacity: 0.7,
+            eraser: true,
+        });
+        preview.ingest(&[sample(10.0, 1.0, sample_flags::DOWN, 1)]);
+        let dab = preview.active().last().unwrap();
+        assert_eq!(dab.diameter, 30.0);
+        assert!(dab.eraser);
+    }
+
+    #[test]
+    fn settings_changed_midstroke_wait_until_terminal_event() {
+        let mut preview = StrokePreview::default();
+        preview.ingest(&[sample(0.0, 1.0, sample_flags::DOWN, 1)]);
+        preview.set_brush_settings(BrushSettings {
+            size_px: 40.0,
+            ..BrushSettings::default()
+        });
+        preview.ingest(&[sample(4.0, 1.0, sample_flags::MOVE, 2)]);
+        assert_eq!(preview.active().last().unwrap().diameter, 14.0);
+        preview.ingest(&[sample(4.0, 1.0, sample_flags::UP, 3)]);
+        assert_eq!(preview.brush_settings().size_px, 40.0);
+    }
+
+    #[test]
+    fn selected_srgb_color_is_converted_to_linear_raster_bytes() {
+        let mut preview = StrokePreview::default();
+        preview.set_brush_settings(BrushSettings {
+            color_srgb: [200, 0, 70],
+            size_px: 14.0,
+            opacity: 1.0,
+            eraser: false,
+        });
+        preview.ingest(&[
+            sample(30.0, 1.0, sample_flags::DOWN, 1),
+            sample(30.0, 1.0, sample_flags::UP, 2),
+        ]);
+        let pixel = preview.raster().pixel_rgba(30, 10);
+        assert!(pixel[0] >= 145 && pixel[0] <= 149);
+        assert_eq!(pixel[1], 0);
+        assert!(pixel[2] >= 15 && pixel[2] <= 18);
+        assert!(pixel[3] > 0);
     }
 
     #[test]

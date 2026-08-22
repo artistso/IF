@@ -10,7 +10,8 @@ const MAX_SPACING_PX: f32 = 4.0;
 /// state is no longer bounded by this value; only the legacy Vulkan replay is.
 pub(crate) const MAX_BOOTSTRAP_DABS: usize = 4096;
 const MAX_PREDICTED_DABS: usize = 512;
-const BOOTSTRAP_INK_RGBA: [u8; 4] = [240, 240, 250, 255];
+// Linear-space equivalent of the default theme's deep rose display ink.
+const BOOTSTRAP_INK_RGBA: [u8; 4] = [147, 0, 16, 255];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StrokeDab {

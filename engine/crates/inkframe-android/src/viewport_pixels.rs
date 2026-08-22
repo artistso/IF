@@ -99,18 +99,50 @@ fn encode_linear_channel(value: f32, transfer: TransferEncoding) -> u8 {
     (encoded * 255.0).round() as u8
 }
 
-/// Converts one premultiplied linear RGBA8 document tile into an opaque display
-/// tile. Composition happens in linear space; only the final RGB is converted
-/// to the transfer function required by the Vulkan image format. This keeps a
-/// stroke visually stable when it moves from the active render-pass overlay
-/// into the persistent cache on UP.
-pub(crate) fn encode_opaque_tile(
+fn encode_pixel(src: &[u8], encoding: PixelEncoding, background: [f32; 3], output: &mut Vec<u8>) {
+    let alpha = src[3] as f32 / 255.0;
+    let inverse_alpha = 1.0 - alpha;
+    // Source RGB is already premultiplied in linear space.
+    let r = encode_linear_channel(
+        src[0] as f32 / 255.0 + background[0] * inverse_alpha,
+        encoding.transfer,
+    );
+    let g = encode_linear_channel(
+        src[1] as f32 / 255.0 + background[1] * inverse_alpha,
+        encoding.transfer,
+    );
+    let b = encode_linear_channel(
+        src[2] as f32 / 255.0 + background[2] * inverse_alpha,
+        encoding.transfer,
+    );
+    match encoding.order {
+        PixelOrder::Rgba => output.extend_from_slice(&[r, g, b, 255]),
+        PixelOrder::Bgra => output.extend_from_slice(&[b, g, r, 255]),
+    }
+}
+
+/// Encodes only the requested tile-local rectangle into tightly packed display
+/// pixels. This keeps CPU conversion and staging memory proportional to actual
+/// dirty area rather than paying 256x256 pixels for every tiny stroke update.
+pub(crate) fn encode_opaque_region(
     source: &[u8],
     encoding: PixelEncoding,
     background_rgb: [u8; 3],
+    local_x: u16,
+    local_y: u16,
+    width: u16,
+    height: u16,
 ) -> Result<Vec<u8>, &'static str> {
     if source.len() != TILE_BYTES {
         return Err("raster tile byte length does not match TILE_BYTES");
+    }
+    if width == 0 || height == 0 {
+        return Err("raster upload region must be non-empty");
+    }
+    let max_x = local_x as u32 + width as u32;
+    let max_y = local_y as u32 + height as u32;
+    if max_x > TILE_SIZE || max_y > TILE_SIZE {
+        return Err("raster upload region exceeds tile bounds");
     }
 
     let background = [
@@ -118,32 +150,37 @@ pub(crate) fn encode_opaque_tile(
         background_rgb[1] as f32 / 255.0,
         background_rgb[2] as f32 / 255.0,
     ];
-    let mut output = vec![0_u8; TILE_BYTES];
-    for (src, dst) in source
-        .chunks_exact(BYTES_PER_PIXEL)
-        .zip(output.chunks_exact_mut(BYTES_PER_PIXEL))
-    {
-        let alpha = src[3] as f32 / 255.0;
-        let inverse_alpha = 1.0 - alpha;
-        // Source RGB is already premultiplied in linear space.
-        let r = encode_linear_channel(
-            src[0] as f32 / 255.0 + background[0] * inverse_alpha,
-            encoding.transfer,
-        );
-        let g = encode_linear_channel(
-            src[1] as f32 / 255.0 + background[1] * inverse_alpha,
-            encoding.transfer,
-        );
-        let b = encode_linear_channel(
-            src[2] as f32 / 255.0 + background[2] * inverse_alpha,
-            encoding.transfer,
-        );
-        match encoding.order {
-            PixelOrder::Rgba => dst.copy_from_slice(&[r, g, b, 255]),
-            PixelOrder::Bgra => dst.copy_from_slice(&[b, g, r, 255]),
+    let pixel_count = width as usize * height as usize;
+    let mut output = Vec::with_capacity(pixel_count * BYTES_PER_PIXEL);
+    for y in local_y..local_y + height {
+        for x in local_x..local_x + width {
+            let index = (y as usize * TILE_SIZE as usize + x as usize) * BYTES_PER_PIXEL;
+            encode_pixel(
+                &source[index..index + BYTES_PER_PIXEL],
+                encoding,
+                background,
+                &mut output,
+            );
         }
     }
+    debug_assert_eq!(output.len(), pixel_count * BYTES_PER_PIXEL);
     Ok(output)
+}
+
+pub(crate) fn encode_opaque_tile(
+    source: &[u8],
+    encoding: PixelEncoding,
+    background_rgb: [u8; 3],
+) -> Result<Vec<u8>, &'static str> {
+    encode_opaque_region(
+        source,
+        encoding,
+        background_rgb,
+        0,
+        0,
+        TILE_SIZE as u16,
+        TILE_SIZE as u16,
+    )
 }
 
 #[cfg(test)]
@@ -200,10 +237,32 @@ mod tests {
     #[test]
     fn premultiplied_pixel_composites_once_in_linear_space() {
         let mut tile = vec![0_u8; TILE_BYTES];
-        // 50% opaque red in premultiplied linear representation.
         tile[0..4].copy_from_slice(&[128, 0, 0, 128]);
         let encoded = encode_opaque_tile(&tile, RGBA_LINEAR, [20, 40, 60]).unwrap();
         assert_eq!(&encoded[0..4], &[138, 20, 30, 255]);
+    }
+
+    #[test]
+    fn compact_region_contains_only_requested_pixels() {
+        let mut tile = vec![0_u8; TILE_BYTES];
+        let index = (7 * TILE_SIZE as usize + 5) * BYTES_PER_PIXEL;
+        tile[index..index + 4].copy_from_slice(&[9, 19, 29, 255]);
+        let encoded = encode_opaque_region(&tile, RGBA_LINEAR, [0; 3], 5, 7, 1, 1).unwrap();
+        assert_eq!(encoded, vec![9, 19, 29, 255]);
+    }
+
+    #[test]
+    fn compact_region_size_tracks_dirty_area() {
+        let tile = vec![0_u8; TILE_BYTES];
+        let encoded = encode_opaque_region(&tile, RGBA_LINEAR, [0; 3], 10, 20, 3, 4).unwrap();
+        assert_eq!(encoded.len(), 3 * 4 * BYTES_PER_PIXEL);
+        assert!(encoded.len() < TILE_BYTES);
+    }
+
+    #[test]
+    fn compact_region_rejects_out_of_bounds_rectangle() {
+        let tile = vec![0_u8; TILE_BYTES];
+        assert!(encode_opaque_region(&tile, RGBA_LINEAR, [0; 3], 255, 255, 2, 1).is_err());
     }
 
     #[test]
@@ -211,7 +270,6 @@ mod tests {
         let mut tile = vec![0_u8; TILE_BYTES];
         tile[0..4].copy_from_slice(&[128, 0, 0, 255]);
         let encoded = encode_opaque_tile(&tile, RGBA_SRGB, [0, 0, 0]).unwrap();
-        // Linear 0.502 maps to approximately sRGB 0.737.
         assert_eq!(&encoded[0..4], &[188, 0, 0, 255]);
     }
 

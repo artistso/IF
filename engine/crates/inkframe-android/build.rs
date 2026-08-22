@@ -2,10 +2,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use naga::ShaderStage;
 use naga::back::spv;
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use naga::ShaderStage;
 
 fn compile_stage(
     module: &naga::Module,
@@ -44,8 +44,12 @@ fn main() -> Result<(), String> {
 
     let source = fs::read_to_string(SHADER_PATH)
         .map_err(|error| format!("reading {SHADER_PATH} failed: {error}"))?;
-    let module = wgsl::parse_str(&source)
-        .map_err(|error| format!("parsing {SHADER_PATH} failed: {}", error.emit_to_string(&source)))?;
+    let module = wgsl::parse_str(&source).map_err(|error| {
+        format!(
+            "parsing {SHADER_PATH} failed: {}",
+            error.emit_to_string(&source)
+        )
+    })?;
     let info = Validator::new(ValidationFlags::all(), Capabilities::all())
         .validate(&module)
         .map_err(|error| format!("validating {SHADER_PATH} failed: {error}"))?;

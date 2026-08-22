@@ -161,7 +161,7 @@ impl EngineHost {
         }
     }
 
-    /// Low-rate control operations are acknowledged by the renderer. Unlike
+    /// Low-rate control operations are acknowledged by the engine thread. Unlike
     /// high-rate stylus input, these commands are never discarded because the
     /// bounded queue is temporarily full.
     pub fn attach_surface(&self, surface: NativeSurface) -> Result<(), SubmitError> {
@@ -270,6 +270,12 @@ fn run_engine<R: RendererBackend>(
     mut renderer: R,
     stats: Arc<Mutex<EngineStats>>,
 ) {
+    // Brush controls are acknowledged/stored immediately without touching the
+    // swapchain. The latest state is injected immediately before the next real
+    // stylus packet, preserving engine-thread ordering while avoiding UI/native
+    // desynchronization when presentation is temporarily unavailable.
+    let mut pending_brush: Option<BrushSettings> = None;
+
     while let Ok(command) = receiver.recv() {
         match command {
             EngineCommand::AttachSurface { surface, reply } => {
@@ -291,19 +297,18 @@ fn run_engine<R: RendererBackend>(
                 let _ = reply.send(result);
             }
             EngineCommand::SetBrush { settings, reply } => {
-                // Reuse the existing renderer input boundary without changing the
-                // public stylus ABI. StrokePreview consumes this tagged internal
-                // sample before normal input processing.
-                let control = brush_settings_sample(settings);
-                let result = renderer.ingest_input(&[control]);
-                note_renderer_error(&stats, &result);
-                let _ = reply.send(result);
+                pending_brush = Some(settings.sanitized());
+                let _ = reply.send(Ok(()));
             }
-            EngineCommand::Input(samples) => {
+            EngineCommand::Input(mut samples) => {
+                let physical_sample_count = samples.len();
+                if let Some(settings) = pending_brush.take() {
+                    samples.insert(0, brush_settings_sample(settings));
+                }
                 {
                     let mut stats = stats.lock().unwrap();
                     stats.input_packets += 1;
-                    stats.input_samples += samples.len() as u64;
+                    stats.input_samples += physical_sample_count as u64;
                 }
                 let result = renderer.ingest_input(&samples);
                 note_renderer_error(&stats, &result);
@@ -339,6 +344,27 @@ mod tests {
         }
     }
 
+    struct CaptureRenderer {
+        packets: Arc<Mutex<Vec<Vec<StrokeSample>>>>,
+    }
+
+    impl RendererBackend for CaptureRenderer {
+        fn attach_surface(&mut self, _surface: NativeSurface) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn detach_surface(&mut self) {}
+
+        fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn ingest_input(&mut self, samples: &[StrokeSample]) -> Result<(), String> {
+            self.packets.lock().unwrap().push(samples.to_vec());
+            Ok(())
+        }
+    }
+
     #[test]
     fn rejects_zero_sized_surfaces() {
         let engine = EngineHost::spawn(NullRenderer);
@@ -368,8 +394,11 @@ mod tests {
     }
 
     #[test]
-    fn brush_control_is_acknowledged() {
-        let engine = EngineHost::spawn(NullRenderer);
+    fn brush_control_is_acknowledged_without_presenting() {
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let engine = EngineHost::spawn(CaptureRenderer {
+            packets: Arc::clone(&packets),
+        });
         assert!(
             engine
                 .set_brush(BrushSettings {
@@ -380,6 +409,48 @@ mod tests {
                 })
                 .is_ok()
         );
+        assert!(packets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_brush_control_is_injected_before_next_stylus_packet() {
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let engine = EngineHost::spawn(CaptureRenderer {
+            packets: Arc::clone(&packets),
+        });
+        engine
+            .set_brush(BrushSettings {
+                color_srgb: [10, 120, 250],
+                size_px: 32.0,
+                opacity: 0.25,
+                eraser: true,
+            })
+            .unwrap();
+        engine
+            .submit_input(vec![StrokeSample {
+                x: 1.0,
+                y: 2.0,
+                pressure: 1.0,
+                tilt: 0.0,
+                orientation: 0.0,
+                time_ns: 1,
+                flags: sample_flags::DOWN,
+            }])
+            .unwrap();
+
+        // Wait for the asynchronous input packet to cross the engine thread.
+        for _ in 0..100 {
+            if !packets.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let captured = packets.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 2);
+        assert_ne!(captured[0][0].flags & BRUSH_SETTINGS_SAMPLE_FLAG, 0);
+        assert_ne!(captured[0][0].flags & sample_flags::ERASER, 0);
+        assert_eq!(captured[0][1].flags, sample_flags::DOWN);
     }
 
     #[test]

@@ -5,11 +5,14 @@ use ash::{Device, Entry, Instance, khr, vk};
 use inkframe_core::StrokeSample;
 use inkframe_engine::{NativeSurface, RendererBackend};
 
-const BACKGROUND_COLOR: [f32; 4] = [0.055, 0.055, 0.065, 1.0];
-const BACKGROUND_RGB8: [u8; 3] = [14, 14, 17];
-const INK_COLOR: [f32; 4] = [0.94, 0.94, 0.98, 1.0];
-const PREDICTED_COLOR: [f32; 4] = [0.55, 0.65, 0.90, 1.0];
-const PREDICTED_ERASER_COLOR: [f32; 4] = [0.18, 0.20, 0.26, 1.0];
+// The default InkFrame theme uses a warm paper surface. Values here are linear
+// because both Vulkan sRGB attachments and viewport pixel encoding perform the
+// transfer conversion at the presentation boundary.
+const BACKGROUND_COLOR: [f32; 4] = [1.0, 0.888, 0.913, 1.0];
+const BACKGROUND_RGB8: [u8; 3] = [255, 226, 233];
+const INK_COLOR: [f32; 4] = [0.578, 0.0, 0.061, 1.0];
+const PREDICTED_COLOR: [f32; 4] = [1.0, 0.072, 0.283, 1.0];
+const PREDICTED_ERASER_COLOR: [f32; 4] = [0.78, 0.66, 0.70, 1.0];
 
 struct SwapchainState {
     loader: khr::swapchain::Device,
@@ -797,6 +800,7 @@ impl AndroidRenderer {
                 Self::emit_dab(device, command_buffer, state.extent, dab, false);
             }
         }
+
         for &dab in self.stroke.predicted() {
             Self::emit_dab(device, command_buffer, state.extent, dab, true);
         }

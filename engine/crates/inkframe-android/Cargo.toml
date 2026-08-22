@@ -16,6 +16,9 @@ inkframe-core.workspace = true
 inkframe-engine.workspace = true
 inkframe-raster.workspace = true
 
+[build-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in", "spv-out"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 ash = "0.38.0"
 jni = "0.22.4"

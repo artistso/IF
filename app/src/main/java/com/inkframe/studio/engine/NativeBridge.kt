@@ -13,5 +13,12 @@ internal object NativeBridge {
     @JvmStatic external fun attachSurface(engineId: Long, surface: Surface, width: Int, height: Int): Boolean
     @JvmStatic external fun detachSurface(engineId: Long): Boolean
     @JvmStatic external fun resizeSurface(engineId: Long, width: Int, height: Int): Boolean
+    @JvmStatic external fun setBrush(
+        engineId: Long,
+        colorRgb: Int,
+        sizePx: Float,
+        opacity: Float,
+        eraser: Boolean,
+    ): Boolean
     @JvmStatic external fun pushInput(engineId: Long, buffer: ByteBuffer, sampleCount: Int): Boolean
 }

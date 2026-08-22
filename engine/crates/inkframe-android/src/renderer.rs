@@ -1,3 +1,5 @@
+use crate::brush_geometry::BrushInstance;
+use crate::brush_pipeline::{BrushPipeline, MAX_BRUSH_INSTANCES};
 use crate::stroke::{MAX_BOOTSTRAP_DABS, StrokeDab, StrokePreview};
 use crate::viewport::{ViewportCache, transition_swapchain_for_legacy_render};
 use crate::viewport_pixels::full_tile_rect;
@@ -11,6 +13,7 @@ use inkframe_engine::{NativeSurface, RendererBackend};
 const BACKGROUND_COLOR: [f32; 4] = [1.0, 0.888, 0.913, 1.0];
 const BACKGROUND_RGB8: [u8; 3] = [255, 226, 233];
 const PREDICTED_ERASER_COLOR: [f32; 4] = [0.78, 0.66, 0.70, 1.0];
+const PREDICTED_ALPHA_SCALE: f32 = 0.55;
 
 struct SwapchainState {
     loader: khr::swapchain::Device,
@@ -26,6 +29,7 @@ struct SwapchainState {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
+    brush_pipeline: Option<BrushPipeline>,
     persistent_copy_supported: bool,
 }
 
@@ -51,6 +55,7 @@ impl SwapchainState {
             image_available: vk::Semaphore::null(),
             render_finished: vk::Semaphore::null(),
             in_flight: vk::Fence::null(),
+            brush_pipeline: None,
             persistent_copy_supported,
         }
     }
@@ -65,6 +70,9 @@ impl SwapchainState {
             }
             if self.image_available != vk::Semaphore::null() {
                 device.destroy_semaphore(self.image_available, None);
+            }
+            if let Some(pipeline) = self.brush_pipeline.take() {
+                pipeline.destroy(device);
             }
             if self.command_pool != vk::CommandPool::null() {
                 device.destroy_command_pool(self.command_pool, None);
@@ -491,6 +499,14 @@ impl AndroidRenderer {
             state.render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }
                 .map_err(|e| format!("vkCreateRenderPass failed: {e:?}"))?;
 
+            state.brush_pipeline = Some(BrushPipeline::new(
+                &self.instance,
+                device,
+                physical_device,
+                state.render_pass,
+                extent,
+            )?);
+
             for &view in &state.image_views {
                 let framebuffer_attachments = [view];
                 let framebuffer_info = vk::FramebufferCreateInfo::default()
@@ -652,30 +668,6 @@ impl AndroidRenderer {
         Ok(())
     }
 
-    fn dab_rect(dab: StrokeDab, extent: vk::Extent2D) -> Option<vk::ClearRect> {
-        let half = dab.diameter.max(1.0) * 0.5;
-        let max_x = extent.width as f32;
-        let max_y = extent.height as f32;
-        let left = (dab.x - half).floor().clamp(0.0, max_x) as i32;
-        let top = (dab.y - half).floor().clamp(0.0, max_y) as i32;
-        let right = (dab.x + half).ceil().clamp(0.0, max_x) as i32;
-        let bottom = (dab.y + half).ceil().clamp(0.0, max_y) as i32;
-        if right <= left || bottom <= top {
-            return None;
-        }
-        Some(vk::ClearRect {
-            rect: vk::Rect2D {
-                offset: vk::Offset2D { x: left, y: top },
-                extent: vk::Extent2D {
-                    width: (right - left) as u32,
-                    height: (bottom - top) as u32,
-                },
-            },
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-    }
-
     fn clear_background(device: &Device, command_buffer: vk::CommandBuffer, extent: vk::Extent2D) {
         let attachment = vk::ClearAttachment::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -698,16 +690,11 @@ impl AndroidRenderer {
         }
     }
 
-    fn emit_dab(
-        device: &Device,
-        command_buffer: vk::CommandBuffer,
-        extent: vk::Extent2D,
+    fn brush_instance(
         dab: StrokeDab,
+        extent: vk::Extent2D,
         predicted: bool,
-    ) {
-        let Some(rect) = Self::dab_rect(dab, extent) else {
-            return;
-        };
+    ) -> Option<BrushInstance> {
         let color = if dab.eraser {
             if predicted {
                 PREDICTED_ERASER_COLOR
@@ -717,15 +704,56 @@ impl AndroidRenderer {
         } else {
             dab.display_color
         };
-        let attachment = vk::ClearAttachment::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .color_attachment(0)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue { float32: color },
-            });
-        unsafe {
-            device.cmd_clear_attachments(command_buffer, &[attachment], &[rect]);
+        BrushInstance::from_pixels(
+            dab.x,
+            dab.y,
+            dab.diameter,
+            color,
+            extent.width,
+            extent.height,
+            if predicted { PREDICTED_ALPHA_SCALE } else { 1.0 },
+        )
+    }
+
+    fn brush_instances(&self, state: &SwapchainState) -> Vec<BrushInstance> {
+        let mut instances = Vec::with_capacity(MAX_BRUSH_INSTANCES.min(
+            self.stroke.active().len()
+                + self.stroke.predicted().len()
+                + if self.viewport_cache.is_some() {
+                    0
+                } else {
+                    self.stroke.committed().len().min(MAX_BOOTSTRAP_DABS)
+                },
+        ));
+
+        if self.viewport_cache.is_some() {
+            instances.extend(
+                self.stroke
+                    .active()
+                    .iter()
+                    .copied()
+                    .filter_map(|dab| Self::brush_instance(dab, state.extent, false)),
+            );
+        } else {
+            instances.extend(
+                self.stroke
+                    .committed()
+                    .iter()
+                    .take(MAX_BOOTSTRAP_DABS)
+                    .copied()
+                    .filter_map(|dab| Self::brush_instance(dab, state.extent, false)),
+            );
         }
+
+        instances.extend(
+            self.stroke
+                .predicted()
+                .iter()
+                .copied()
+                .filter_map(|dab| Self::brush_instance(dab, state.extent, true)),
+        );
+        instances.truncate(MAX_BRUSH_INSTANCES);
+        instances
     }
 
     fn record_frame(
@@ -749,6 +777,12 @@ impl AndroidRenderer {
             .images
             .get(image_index as usize)
             .ok_or_else(|| "swapchain image index is invalid".to_string())?;
+        let brush_pipeline = state
+            .brush_pipeline
+            .as_ref()
+            .ok_or_else(|| "swapchain has no round brush pipeline".to_string())?;
+        let brush_instances = self.brush_instances(state);
+        let brush_instance_count = brush_pipeline.upload_instances(device, &brush_instances)?;
 
         unsafe {
             device
@@ -782,26 +816,15 @@ impl AndroidRenderer {
             );
         }
 
-        if self.viewport_cache.is_some() {
-            // Completed strokes already live in the persistent viewport cache.
-            // Only the still-cancellable actual stroke is drawn as an overlay.
-            for &dab in self.stroke.active() {
-                Self::emit_dab(device, command_buffer, state.extent, dab, false);
-            }
-        } else {
+        if self.viewport_cache.is_none() {
             // Compatibility fallback for surfaces without TRANSFER_DST or a
-            // supported 32-bit RGBA/BGRA format.
+            // supported 32-bit RGBA/BGRA format. The round brush batch then
+            // replays the bounded history over this base.
             Self::clear_background(device, command_buffer, state.extent);
-            for &dab in self.stroke.committed().iter().take(MAX_BOOTSTRAP_DABS) {
-                Self::emit_dab(device, command_buffer, state.extent, dab, false);
-            }
-        }
-
-        for &dab in self.stroke.predicted() {
-            Self::emit_dab(device, command_buffer, state.extent, dab, true);
         }
 
         unsafe {
+            brush_pipeline.record(device, command_buffer, brush_instance_count);
             device.cmd_end_render_pass(command_buffer);
             device
                 .end_command_buffer(command_buffer)

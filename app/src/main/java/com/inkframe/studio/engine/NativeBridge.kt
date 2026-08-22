@@ -5,7 +5,7 @@ import java.nio.ByteBuffer
 
 internal object NativeBridge {
     init {
-        System.loadLibrary("inkframe_engine")
+        System.loadLibrary("inkframe_android")
     }
 
     @JvmStatic external fun createEngine(): Long

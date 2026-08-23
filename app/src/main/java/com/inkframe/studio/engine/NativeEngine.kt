@@ -37,6 +37,11 @@ class NativeEngine : Closeable {
         return id != 0L && NativeBridge.pushInput(id, buffer, sampleCount)
     }
 
+    fun performanceStats(): String {
+        val id = engineId
+        return if (id != 0L) NativeBridge.performanceStats(id) else "unavailable"
+    }
+
     @Synchronized
     override fun close() {
         val id = engineId

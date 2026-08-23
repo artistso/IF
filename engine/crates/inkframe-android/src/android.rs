@@ -22,7 +22,11 @@ fn engines() -> &'static Mutex<HashMap<i64, EngineEntry>> {
 }
 
 fn engine(id: jlong) -> Option<Arc<EngineHost>> {
-    engines().lock().ok()?.get(&id).map(|entry| Arc::clone(&entry.host))
+    engines()
+        .lock()
+        .ok()?
+        .get(&id)
+        .map(|entry| Arc::clone(&entry.host))
 }
 
 fn performance_summary(id: jlong) -> Option<String> {

@@ -711,7 +711,11 @@ impl AndroidRenderer {
             color,
             extent.width,
             extent.height,
-            if predicted { PREDICTED_ALPHA_SCALE } else { 1.0 },
+            if predicted {
+                PREDICTED_ALPHA_SCALE
+            } else {
+                1.0
+            },
         )
     }
 

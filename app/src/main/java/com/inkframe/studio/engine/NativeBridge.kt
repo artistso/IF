@@ -21,4 +21,5 @@ internal object NativeBridge {
         eraser: Boolean,
     ): Boolean
     @JvmStatic external fun pushInput(engineId: Long, buffer: ByteBuffer, sampleCount: Int): Boolean
+    @JvmStatic external fun performanceStats(engineId: Long): String
 }

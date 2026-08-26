@@ -1,6 +1,7 @@
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod brush_geometry;
+mod perf;
 mod stroke;
 mod viewport_pixels;
 

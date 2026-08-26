@@ -1,11 +1,13 @@
 use crate::brush_geometry::BrushInstance;
 use crate::brush_pipeline::{BrushPipeline, MAX_BRUSH_INSTANCES};
+use crate::perf::{FrameTimingSample, SharedFrameTimingStats, duration_us};
 use crate::stroke::{MAX_BOOTSTRAP_DABS, StrokeDab, StrokePreview};
 use crate::viewport::{ViewportCache, transition_swapchain_for_legacy_render};
 use crate::viewport_pixels::full_tile_rect;
 use ash::{Device, Entry, Instance, khr, vk};
 use inkframe_core::StrokeSample;
 use inkframe_engine::{NativeSurface, RendererBackend};
+use std::time::Instant;
 
 // The default InkFrame theme uses a warm paper surface. Values here are linear
 // because both Vulkan sRGB attachments and viewport pixel encoding perform the
@@ -14,6 +16,15 @@ const BACKGROUND_COLOR: [f32; 4] = [1.0, 0.888, 0.913, 1.0];
 const BACKGROUND_RGB8: [u8; 3] = [255, 226, 233];
 const PREDICTED_ERASER_COLOR: [f32; 4] = [0.78, 0.66, 0.70, 1.0];
 const PREDICTED_ALPHA_SCALE: f32 = 0.55;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PresentFrameTiming {
+    wait_acquire_us: u64,
+    record_us: u64,
+    submit_us: u64,
+    queue_present_us: u64,
+    brush_instances: u64,
+}
 
 struct SwapchainState {
     loader: khr::swapchain::Device,
@@ -118,10 +129,11 @@ pub(crate) struct AndroidRenderer {
     height: u32,
     last_input_time_ns: i64,
     stroke: StrokePreview,
+    perf_stats: SharedFrameTimingStats,
 }
 
 impl AndroidRenderer {
-    pub(crate) fn new() -> Result<Self, String> {
+    pub(crate) fn new(perf_stats: SharedFrameTimingStats) -> Result<Self, String> {
         let entry =
             unsafe { Entry::load() }.map_err(|e| format!("Vulkan loader unavailable: {e}"))?;
         let app_name = c"InkFrame";
@@ -161,6 +173,7 @@ impl AndroidRenderer {
             height: 0,
             last_input_time_ns: 0,
             stroke: StrokePreview::default(),
+            perf_stats,
         })
     }
 
@@ -764,7 +777,7 @@ impl AndroidRenderer {
         &self,
         state: &SwapchainState,
         image_index: u32,
-    ) -> Result<vk::CommandBuffer, String> {
+    ) -> Result<(vk::CommandBuffer, u64), String> {
         let device = self
             .device
             .as_ref()
@@ -834,10 +847,10 @@ impl AndroidRenderer {
                 .end_command_buffer(command_buffer)
                 .map_err(|e| format!("vkEndCommandBuffer failed: {e:?}"))?;
         }
-        Ok(command_buffer)
+        Ok((command_buffer, brush_instance_count as u64))
     }
 
-    fn present_frame(&mut self) -> Result<(), String> {
+    fn present_frame(&mut self) -> Result<PresentFrameTiming, String> {
         let device = self
             .device
             .as_ref()
@@ -850,6 +863,7 @@ impl AndroidRenderer {
             .as_ref()
             .ok_or_else(|| "Vulkan swapchain is not initialized".to_string())?;
 
+        let wait_acquire_started = Instant::now();
         unsafe {
             device
                 .wait_for_fences(&[state.in_flight], true, u64::MAX)
@@ -864,11 +878,16 @@ impl AndroidRenderer {
             )
         }
         .map_err(|e| format!("vkAcquireNextImageKHR failed: {e:?}"))?;
+        let wait_acquire_us = duration_us(wait_acquire_started.elapsed());
         if acquire_suboptimal {
             return Err("Vulkan swapchain became suboptimal during image acquisition".into());
         }
 
-        let command_buffer = self.record_frame(state, image_index)?;
+        let record_started = Instant::now();
+        let (command_buffer, brush_instances) = self.record_frame(state, image_index)?;
+        let record_us = duration_us(record_started.elapsed());
+
+        let submit_started = Instant::now();
         unsafe {
             device
                 .reset_fences(&[state.in_flight])
@@ -891,7 +910,9 @@ impl AndroidRenderer {
                 .queue_submit(queue, &[submit_info], state.in_flight)
                 .map_err(|e| format!("vkQueueSubmit failed: {e:?}"))?;
         }
+        let submit_us = duration_us(submit_started.elapsed());
 
+        let queue_present_started = Instant::now();
         let present_wait = [state.render_finished];
         let swapchains = [state.swapchain];
         let image_indices = [image_index];
@@ -901,10 +922,17 @@ impl AndroidRenderer {
             .image_indices(&image_indices);
         let present_suboptimal = unsafe { state.loader.queue_present(queue, &present_info) }
             .map_err(|e| format!("vkQueuePresentKHR failed: {e:?}"))?;
+        let queue_present_us = duration_us(queue_present_started.elapsed());
         if present_suboptimal {
             return Err("Vulkan swapchain became suboptimal during presentation".into());
         }
-        Ok(())
+        Ok(PresentFrameTiming {
+            wait_acquire_us,
+            record_us,
+            submit_us,
+            queue_present_us,
+            brush_instances,
+        })
     }
 
     fn recreate_and_present(
@@ -917,7 +945,7 @@ impl AndroidRenderer {
         for _attempt in 0..2 {
             match self.create_swapchain(surface, width, height) {
                 Ok(()) => match self.present_frame() {
-                    Ok(()) => return Ok(()),
+                    Ok(_) => return Ok(()),
                     Err(error) => {
                         // Presentation may fail after queue submission. Do not tear down
                         // synchronization/render objects until submitted work is idle.
@@ -996,7 +1024,10 @@ impl RendererBackend for AndroidRenderer {
         if samples.is_empty() {
             return Ok(());
         }
+        let frame_started = Instant::now();
+        let stroke_started = Instant::now();
         self.stroke.ingest(samples);
+        let stroke_us = duration_us(stroke_started.elapsed());
         if let Some(last) = samples.last() {
             self.last_input_time_ns = last.time_ns;
         }
@@ -1018,10 +1049,27 @@ impl RendererBackend for AndroidRenderer {
         // UP may have just sealed persistent raster pixels. Upload only those
         // dirty tile regions before the next base-frame copy. MOVE/prediction
         // packets normally produce no persistent dirt and return immediately.
+        let raster_sync_started = Instant::now();
         self.sync_dirty_raster_to_viewport()?;
+        let raster_sync_us = duration_us(raster_sync_started.elapsed());
 
         match self.present_frame() {
-            Ok(()) => Ok(()),
+            Ok(present) => {
+                let sample = FrameTimingSample {
+                    total_us: duration_us(frame_started.elapsed()),
+                    stroke_us,
+                    raster_sync_us,
+                    wait_acquire_us: present.wait_acquire_us,
+                    record_us: present.record_us,
+                    submit_us: present.submit_us,
+                    queue_present_us: present.queue_present_us,
+                    brush_instances: present.brush_instances,
+                };
+                if let Ok(mut stats) = self.perf_stats.lock() {
+                    stats.record(sample);
+                }
+                Ok(())
+            }
             Err(first_error) => self
                 .recreate_and_present(surface, self.width, self.height)
                 .map_err(|recovery_error| {

@@ -1,13 +1,72 @@
-use crate::perf::{SharedFrameTimingStats, shared_frame_timing_stats};
+use crate::perf::{SharedFrameTimingStats, duration_us, shared_frame_timing_stats};
 use crate::renderer::AndroidRenderer;
-use inkframe_core::decode_stroke_samples;
-use inkframe_engine::{BrushSettings, EngineHost, NativeSurface};
+use inkframe_core::{StrokeSample, decode_stroke_samples};
+use inkframe_engine::{BrushSettings, EngineHost, NativeSurface, RendererBackend};
 use jni::EnvUnowned;
 use jni::objects::{JByteBuffer, JClass, JObject};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jfloat, jint, jlong, jstring};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+/// Wraps the Android renderer only to account for successful input-driven
+/// recovery frames. The inner renderer records the full steady-state stage
+/// breakdown. If a successful input returns without increasing the shared frame
+/// count, the frame succeeded through swapchain recovery; record its total wall
+/// time without inventing a misleading steady-state stage breakdown.
+struct InstrumentedRenderer {
+    inner: AndroidRenderer,
+    perf_stats: SharedFrameTimingStats,
+    surface_attached: bool,
+    observed_frames: u64,
+}
+
+impl InstrumentedRenderer {
+    fn new(inner: AndroidRenderer, perf_stats: SharedFrameTimingStats) -> Self {
+        Self {
+            inner,
+            perf_stats,
+            surface_attached: false,
+            observed_frames: 0,
+        }
+    }
+}
+
+impl RendererBackend for InstrumentedRenderer {
+    fn attach_surface(&mut self, surface: NativeSurface) -> Result<(), String> {
+        let result = self.inner.attach_surface(surface);
+        self.surface_attached = result.is_ok();
+        result
+    }
+
+    fn detach_surface(&mut self) {
+        self.inner.detach_surface();
+        self.surface_attached = false;
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.inner.resize(width, height)
+    }
+
+    fn ingest_input(&mut self, samples: &[StrokeSample]) -> Result<(), String> {
+        if samples.is_empty() {
+            return self.inner.ingest_input(samples);
+        }
+
+        let started = Instant::now();
+        let result = self.inner.ingest_input(samples);
+        if result.is_ok() && self.surface_attached {
+            if let Ok(mut stats) = self.perf_stats.lock() {
+                if stats.frames == self.observed_frames {
+                    stats.record_recovery_total(duration_us(started.elapsed()));
+                }
+                self.observed_frames = stats.frames;
+            }
+        }
+        result
+    }
+}
 
 struct EngineEntry {
     host: Arc<EngineHost>,
@@ -47,6 +106,7 @@ pub extern "system" fn Java_com_inkframe_studio_engine_NativeBridge_createEngine
                 Ok(renderer) => renderer,
                 Err(_) => return Ok(0),
             };
+            let renderer = InstrumentedRenderer::new(renderer, Arc::clone(&perf_stats));
             let id = NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed);
             let host = Arc::new(EngineHost::spawn(renderer));
             engines()

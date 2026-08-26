@@ -33,7 +33,10 @@ pub(crate) struct FrameTimingStats {
     pub queue_present_us_sum: u64,
     pub frames_over_120hz_budget: u64,
     pub frames_over_60hz_budget: u64,
-    pub max_brush_instances: u64,
+    /// Peak brush batch among steady-state frames with a complete stage sample.
+    /// Recovery frames intentionally have total timing only, so they are outside
+    /// the scope of this metric rather than being represented by an estimate.
+    pub max_stage_brush_instances: u64,
 }
 
 impl FrameTimingStats {
@@ -64,7 +67,7 @@ impl FrameTimingStats {
         self.queue_present_us_sum = self
             .queue_present_us_sum
             .saturating_add(sample.queue_present_us);
-        self.max_brush_instances = self.max_brush_instances.max(sample.brush_instances);
+        self.max_stage_brush_instances = self.max_stage_brush_instances.max(sample.brush_instances);
     }
 
     /// Records a successful input-driven frame whose swapchain had to be
@@ -87,7 +90,7 @@ impl FrameTimingStats {
                 "avg_total_us={} max_total_us={} ",
                 "avg_stroke_us={} avg_raster_sync_us={} avg_wait_acquire_us={} ",
                 "avg_record_us={} avg_submit_us={} avg_queue_present_us={} ",
-                "over_120hz={} over_60hz={} max_instances={}"
+                "over_120hz={} over_60hz={} max_stage_instances={}"
             ),
             self.frames,
             self.stage_frames,
@@ -102,7 +105,7 @@ impl FrameTimingStats {
             Self::average(self.queue_present_us_sum, self.stage_frames),
             self.frames_over_120hz_budget,
             self.frames_over_60hz_budget,
-            self.max_brush_instances,
+            self.max_stage_brush_instances,
         )
     }
 }
@@ -150,9 +153,10 @@ mod tests {
         assert_eq!(stats.total_us_max, 20_000);
         assert_eq!(stats.frames_over_120hz_budget, 1);
         assert_eq!(stats.frames_over_60hz_budget, 1);
-        assert_eq!(stats.max_brush_instances, 480);
+        assert_eq!(stats.max_stage_brush_instances, 480);
         assert!(stats.debug_summary().contains("avg_total_us=14000"));
         assert!(stats.debug_summary().contains("avg_record_us=2750"));
+        assert!(stats.debug_summary().contains("max_stage_instances=480"));
     }
 
     #[test]
@@ -177,10 +181,12 @@ mod tests {
         assert_eq!(stats.total_us_max, 25_000);
         assert_eq!(stats.frames_over_120hz_budget, 1);
         assert_eq!(stats.frames_over_60hz_budget, 1);
+        assert_eq!(stats.max_stage_brush_instances, 64);
         let summary = stats.debug_summary();
         assert!(summary.contains("avg_total_us=15500"));
         assert!(summary.contains("avg_stroke_us=1000"));
         assert!(summary.contains("recovery_frames=1"));
+        assert!(summary.contains("max_stage_instances=64"));
     }
 
     #[test]
